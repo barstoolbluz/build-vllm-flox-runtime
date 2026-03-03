@@ -2,7 +2,7 @@
 
 stdenv.mkDerivation {
   pname = "vllm-flox-runtime";
-  version = "0.1.0";
+  version = "0.9.1";
 
   src = ../../scripts;
 
