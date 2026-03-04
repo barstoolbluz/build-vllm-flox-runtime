@@ -10,6 +10,8 @@
 #
 #   Always required:
 #     FLOX_ENV_PROJECT            Project root (unless VLLM_CONFIG_FILE is set)
+#     VLLM_HOST                   Bind address (non-empty)
+#     VLLM_PORT                   Listen port (> 0)
 #     VLLM_TENSOR_PARALLEL_SIZE   > 0
 #     VLLM_PIPELINE_PARALLEL_SIZE > 0
 #     VLLM_KV_CACHE_DTYPE         non-empty (no whitespace)
@@ -309,6 +311,8 @@ esac
 # -----------------------------
 # Validate required config/env
 # -----------------------------
+require_nonempty VLLM_HOST
+require_pos_int VLLM_PORT
 require_pos_int VLLM_TENSOR_PARALLEL_SIZE
 require_pos_int VLLM_PIPELINE_PARALLEL_SIZE
 require_pos_int VLLM_MAX_MODEL_LEN
@@ -336,6 +340,8 @@ fi
 cmd=(
   vllm serve "$_VLLM_RESOLVED_MODEL"
   --config "$_config_file"
+  --host "$VLLM_HOST"
+  --port "$VLLM_PORT"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
   --kv-cache-dtype "$VLLM_KV_CACHE_DTYPE"
