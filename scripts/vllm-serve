@@ -10,8 +10,6 @@
 #
 #   Always required:
 #     FLOX_ENV_PROJECT            Project root (unless VLLM_CONFIG_FILE is set)
-#     VLLM_HOST                   Bind address (non-empty)
-#     VLLM_PORT                   Listen port (> 0)
 #     VLLM_TENSOR_PARALLEL_SIZE   > 0
 #     VLLM_PIPELINE_PARALLEL_SIZE > 0
 #     VLLM_KV_CACHE_DTYPE         non-empty (no whitespace)
@@ -41,6 +39,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 err() { printf 'ERROR: %s\n' "$*" >&2; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 
 on_err() {
@@ -141,38 +140,59 @@ slugify() {
   printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'
 }
 
+derive_expected_model_identity() {
+  EXPECTED_MODEL_ID=""
+  EXPECTED_MODEL_IDENTITY=""
+
+  if [[ -n "${VLLM_MODEL_ID:-}" ]]; then
+    EXPECTED_MODEL_ID="$VLLM_MODEL_ID"
+  elif [[ -n "${VLLM_MODEL_ORG:-}" || -n "${VLLM_MODEL:-}" ]]; then
+    require_nonempty VLLM_MODEL_ORG
+    require_nonempty VLLM_MODEL
+    EXPECTED_MODEL_ID="$VLLM_MODEL_ORG/$VLLM_MODEL"
+  fi
+
+  if [[ -n "$EXPECTED_MODEL_ID" ]]; then
+    EXPECTED_MODEL_IDENTITY="$EXPECTED_MODEL_ID"
+    if [[ -n "${VLLM_MODEL_REVISION:-}" ]]; then
+      EXPECTED_MODEL_IDENTITY+="@${VLLM_MODEL_REVISION}"
+    fi
+  fi
+}
+
 # -----------------------------
 # Resolve env-file path
 # -----------------------------
+EXPECTED_MODEL_ID=""
+EXPECTED_MODEL_IDENTITY=""
 LEGACY_ENV_FILE=""
+USED_DERIVED_ENV_PATH=false
+
+derive_expected_model_identity
+
 if [[ -z "${VLLM_MODEL_ENV_FILE:-}" ]]; then
   require_nonempty FLOX_ENV_CACHE
   [[ -d "$FLOX_ENV_CACHE" ]] || { err "FLOX_ENV_CACHE is not a directory: $FLOX_ENV_CACHE"; exit 2; }
+  [[ -n "$EXPECTED_MODEL_ID" ]] || { err "Set VLLM_MODEL_ID or VLLM_MODEL_ORG+VLLM_MODEL when VLLM_MODEL_ENV_FILE is not set"; exit 2; }
 
-  _model_id="${VLLM_MODEL_ID:-}"
-  if [[ -z "$_model_id" ]]; then
-    require_nonempty VLLM_MODEL_ORG
-    require_nonempty VLLM_MODEL
-    _model_id="$VLLM_MODEL_ORG/$VLLM_MODEL"
-  fi
-
-  slug="$(slugify "$_model_id")"
+  slug="$(slugify "$EXPECTED_MODEL_ID")"
   LEGACY_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${slug}.env"
 
-  if hash12="$(sha256_12 "$_model_id")"; then
+  if hash12="$(sha256_12 "$EXPECTED_MODEL_IDENTITY")"; then
     VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${slug}.${hash12}.env"
+    USED_DERIVED_ENV_PATH=true
   else
     VLLM_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
   fi
 
-  if [[ ! -f "$VLLM_MODEL_ENV_FILE" && -n "$LEGACY_ENV_FILE" && -f "$LEGACY_ENV_FILE" ]]; then
+  if [[ -z "${VLLM_MODEL_REVISION:-}" && ! -f "$VLLM_MODEL_ENV_FILE" && -n "$LEGACY_ENV_FILE" && -f "$LEGACY_ENV_FILE" ]]; then
     VLLM_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
   fi
 fi
 
 if [[ ! -f "$VLLM_MODEL_ENV_FILE" ]]; then
   err "Model env file not found: $VLLM_MODEL_ENV_FILE"
-  if [[ -n "${LEGACY_ENV_FILE:-}" && "$LEGACY_ENV_FILE" != "$VLLM_MODEL_ENV_FILE" ]]; then
+  if [[ -z "${VLLM_MODEL_REVISION:-}" && -n "${LEGACY_ENV_FILE:-}" && "$LEGACY_ENV_FILE" != "$VLLM_MODEL_ENV_FILE" ]]; then
     err "Also tried legacy path: $LEGACY_ENV_FILE"
   fi
   err "Run vllm-resolve-model first (or set VLLM_MODEL_ENV_FILE)."
@@ -184,7 +204,16 @@ fi
 # Load env file
 # -----------------------------
 tmp_env=""
-cleanup() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
+cleanup() {
+  local ec=$?
+  trap - ERR
+  if [[ -n "${tmp_env:-}" ]] && [[ -f "${tmp_env:-}" ]]; then
+    if ! rm -f -- "$tmp_env"; then
+      err "Failed to remove temp env file: $tmp_env"
+    fi
+  fi
+  return "$ec"
+}
 trap cleanup EXIT
 
 load_env_file_safe() {
@@ -268,7 +297,13 @@ with open(path, 'r', encoding='utf-8') as fh:
             if tail and not tail.startswith('#'):
                 raise SystemExit(f"Unexpected trailing characters after quoted value: {raw.rstrip()}")
         else:
-            val = strip_unquoted_inline_comment(rest)
+            parsed = shlex.split(rest, comments=True, posix=True)
+            if not parsed:
+                val = ""
+            elif len(parsed) == 1:
+                val = parsed[0]
+            else:
+                raise SystemExit(f"Unsupported unquoted value (use quotes for spaces): {raw.rstrip()}")
 
         out.append(f"export {key}={shlex.quote(val)}")
 
@@ -307,12 +342,21 @@ case "${VLLM_ENV_FILE_TRUSTED,,}" in
 esac
 
 [[ -n "${_VLLM_RESOLVED_MODEL:-}" ]] || die "Env file did not set _VLLM_RESOLVED_MODEL: $VLLM_MODEL_ENV_FILE"
+if [[ -n "${EXPECTED_MODEL_IDENTITY:-}" ]]; then
+  if [[ -n "${_VLLM_MODEL_IDENTITY:-}" ]]; then
+    [[ "$_VLLM_MODEL_IDENTITY" == "$EXPECTED_MODEL_IDENTITY" ]] || die "Env file identity mismatch: expected $EXPECTED_MODEL_IDENTITY got $_VLLM_MODEL_IDENTITY"
+  elif [[ -n "${VLLM_MODEL_REVISION:-}" ]]; then
+    die "Env file missing _VLLM_MODEL_IDENTITY for revision-aware launch: $VLLM_MODEL_ENV_FILE"
+  elif [[ -n "${VLLM_MODEL_ID:-}" ]]; then
+    [[ "$VLLM_MODEL_ID" == "$EXPECTED_MODEL_ID" ]] || die "Env file model id mismatch: expected $EXPECTED_MODEL_ID got $VLLM_MODEL_ID"
+  else
+    die "Env file missing _VLLM_MODEL_IDENTITY and VLLM_MODEL_ID; cannot verify requested model identity: $VLLM_MODEL_ENV_FILE"
+  fi
+fi
 
 # -----------------------------
 # Validate required config/env
 # -----------------------------
-require_nonempty VLLM_HOST
-require_pos_int VLLM_PORT
 require_pos_int VLLM_TENSOR_PARALLEL_SIZE
 require_pos_int VLLM_PIPELINE_PARALLEL_SIZE
 require_pos_int VLLM_MAX_MODEL_LEN
@@ -340,8 +384,6 @@ fi
 cmd=(
   vllm serve "$_VLLM_RESOLVED_MODEL"
   --config "$_config_file"
-  --host "$VLLM_HOST"
-  --port "$VLLM_PORT"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
   --kv-cache-dtype "$VLLM_KV_CACHE_DTYPE"
@@ -356,7 +398,20 @@ case "${VLLM_PREFIX_CACHING,,}" in
   *) err "VLLM_PREFIX_CACHING must be true/false/1/0/yes/no, got: $VLLM_PREFIX_CACHING"; exit 2 ;;
 esac
 
+_GUARDED_FLAGS=(
+  --config --tensor-parallel-size --pipeline-parallel-size
+  --kv-cache-dtype --max-model-len --max-num-batched-tokens
+  --served-model-name --enable-prefix-caching
+)
+
 if ((${#VLLM_EXTRA_ARGS[@]})); then
+  for _arg in "${VLLM_EXTRA_ARGS[@]}"; do
+    for _guarded in "${_GUARDED_FLAGS[@]}"; do
+      if [[ "$_arg" == "$_guarded" || "$_arg" == "$_guarded="* ]]; then
+        warn "passthrough arg '$_arg' overrides validated flag '$_guarded'; the passthrough value will take precedence"
+      fi
+    done
+  done
   cmd+=("${VLLM_EXTRA_ARGS[@]}")
 fi
 

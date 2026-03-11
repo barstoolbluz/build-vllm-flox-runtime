@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# vllm-resolve-model — Multi-source model provisioning (hardened, cache-safe).
+# vllm-resolve-model — Multi-source model provisioning (identity-safe, cache-safe).
 #
 # Required:
-#   VLLM_MODEL         — model name (used as local dir name; must be a single safe path element)
+#   VLLM_MODEL         — served/model basename label (must be a safe single path element)
 #   VLLM_MODELS_DIR    — base dir for local models and optional HF cache
 #
 # Optional:
 #   VLLM_MODEL_ID      — explicit HF model ID (org/name); derived if empty
 #   VLLM_MODEL_ORG     — org prefix when deriving model ID from VLLM_MODEL
+#   VLLM_MODEL_REVISION — optional immutable revision/pin for hf-cache/hf-hub and provenance
 #   VLLM_MODEL_SOURCES — comma-separated source order (default: flox,local,hf-cache,r2,hf-hub)
 #
 #   FLOX_ENV           — Flox environment path (for flox source)
@@ -17,10 +18,14 @@
 #
 #   R2_BUCKET          — Cloudflare R2 bucket name (for r2 source)
 #   R2_MODELS_PREFIX   — R2 key prefix for models (for r2 source)
+#   R2_MODEL_OBJECT_PREFIX — optional full object prefix for this model (recommended for immutable/versioned prefixes)
 #   R2_ENDPOINT_URL    — optional AWS CLI endpoint URL (for r2 source)
 #
 #   VLLM_RESOLVE_LOCK_TIMEOUT — seconds to wait for lock (default: 300)
 #   VLLM_SKIP_TOKENIZER_CHECK — set to 1 to skip tokenizer asset checks
+#
+# Local model directories are keyed to model identity (model id + optional revision), not just basename.
+# Provisioned local directories include a provenance file and local reuse requires a provenance match.
 #
 # Logging:
 #   By default, the script KEEPS logs on failure and deletes logs on success.
@@ -82,10 +87,8 @@ _sha256_12() {
 _validate_model_name() {
   local name="$1"
   [[ -n "$name" ]] || _die "VLLM_MODEL is empty"
-  [[ "$name" != */* ]] || _die "VLLM_MODEL must not contain '/': $name"
-  [[ "$name" != *'\'* ]] || _die "VLLM_MODEL must not contain '\\': $name"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || _die "VLLM_MODEL must match ^[A-Za-z0-9._-]+$: $name"
   [[ "$name" != "." && "$name" != ".." ]] || _die "VLLM_MODEL must not be '.' or '..': $name"
-  [[ "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] || _die "VLLM_MODEL must not contain control whitespace"
 }
 
 _run_to_log() {
@@ -306,6 +309,176 @@ _check_model_dir() {
   return 0
 }
 
+_verify_sha256sums() {
+  local dir="$1"
+  local sums_file="$2"
+  local cache_file="$3"
+  local use_cache="$4"
+
+  local -A cached_entries=()
+  if [[ "$use_cache" == "1" && -f "$cache_file" ]]; then
+    local _line _cf _cm _ch
+    while IFS=' ' read -r _cf _cm _ch; do
+      [[ "$_cf" == "#"* || -z "$_cf" ]] && continue
+      cached_entries["$_cf"]="${_cm} ${_ch}"
+    done < "$cache_file"
+  fi
+
+  local failed=0 checked=0
+  local -a new_cache_lines=()
+  new_cache_lines+=("# schema=1")
+
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == "#"* ]] && continue
+    local expected_hash file_rel
+    expected_hash="${line%% *}"
+    file_rel="${line#* }"
+    # strip leading * or space (binary/text mode indicator from sha256sum)
+    file_rel="${file_rel#\*}"
+    file_rel="${file_rel# }"
+    [[ -z "$file_rel" || -z "$expected_hash" ]] && continue
+
+    local fpath="$dir/$file_rel"
+    [[ -f "$fpath" ]] || { _warn "integrity: referenced file missing: $file_rel"; failed=1; continue; }
+
+    local file_mtime
+    file_mtime="$(stat -c '%Y' "$fpath" 2>/dev/null || stat -f '%m' "$fpath" 2>/dev/null || echo 0)"
+
+    if [[ "$use_cache" == "1" && -n "${cached_entries[$file_rel]:-}" ]]; then
+      local cached_mtime cached_hash
+      cached_mtime="${cached_entries[$file_rel]%% *}"
+      cached_hash="${cached_entries[$file_rel]#* }"
+      if [[ "$cached_mtime" == "$file_mtime" && "$cached_hash" == "$expected_hash" ]]; then
+        new_cache_lines+=("$file_rel $file_mtime $cached_hash")
+        checked=$((checked + 1))
+        continue
+      fi
+    fi
+
+    local actual_hash
+    if _has_cmd sha256sum; then
+      actual_hash="$(sha256sum "$fpath" | awk '{print $1}')"
+    elif _has_cmd shasum; then
+      actual_hash="$(shasum -a 256 "$fpath" | awk '{print $1}')"
+    elif _has_cmd openssl; then
+      actual_hash="$(openssl dgst -sha256 "$fpath" | awk '{print $NF}')"
+    else
+      _warn "integrity: no sha256 tool available; skipping sha256sums verification"
+      return 0
+    fi
+
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+      _warn "integrity: SHA256 mismatch for $file_rel (expected $expected_hash, got $actual_hash)"
+      failed=1
+    else
+      new_cache_lines+=("$file_rel $file_mtime $actual_hash")
+      checked=$((checked + 1))
+    fi
+  done < "$sums_file"
+
+  if [[ "$use_cache" == "1" && "$failed" -eq 0 && "$checked" -gt 0 ]]; then
+    if [[ -w "$dir" ]] 2>/dev/null || [[ -w "$(dirname "$cache_file")" ]] 2>/dev/null; then
+      printf '%s\n' "${new_cache_lines[@]}" > "$cache_file" 2>/dev/null || true
+    fi
+  fi
+
+  return "$failed"
+}
+
+_verify_nonzero_weights() {
+  local dir="$1"
+  shopt -s nullglob
+  local wfiles=(
+    "$dir"/*.safetensors
+    "$dir"/pytorch_model*.bin
+    "$dir"/*.bin
+    "$dir"/*.pt
+    "$dir"/*.pth
+    "$dir"/*.gguf
+  )
+  shopt -u nullglob
+
+  local f
+  for f in "${wfiles[@]}"; do
+    [[ -f "$f" ]] || continue
+    if [[ ! -s "$f" ]]; then
+      _warn "integrity: zero-byte weight file: $(basename "$f")"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_check_model_integrity() {
+  local dir="$1"
+
+  [[ "${VLLM_SKIP_INTEGRITY_CHECK:-0}" == "1" ]] && return 0
+
+  local use_cache="${VLLM_CACHE_INTEGRITY_HASH:-0}"
+  local cache_file="$dir/.vllm-integrity-cache"
+
+  # Strategy 1: sha256sums.txt
+  if [[ -f "$dir/sha256sums.txt" ]]; then
+    if _verify_sha256sums "$dir" "$dir/sha256sums.txt" "$cache_file" "$use_cache"; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+
+  # Strategy 2: safetensors header validation (fast truncation check)
+  shopt -s nullglob
+  local st_files=( "$dir"/*.safetensors )
+  shopt -u nullglob
+  if (( ${#st_files[@]} > 0 )) && _has_cmd python3; then
+    if ! python3 - "$dir" <<'PY'
+import os, sys, struct, json
+
+d = sys.argv[1]
+errors = []
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith(".safetensors"):
+        continue
+    fpath = os.path.join(d, fn)
+    fsize = os.path.getsize(fpath)
+    if fsize == 0:
+        errors.append(f"zero-byte safetensors file: {fn}")
+        continue
+    if fsize < 8:
+        errors.append(f"truncated safetensors file (< 8 bytes): {fn}")
+        continue
+    with open(fpath, "rb") as f:
+        hdr_size_bytes = f.read(8)
+    hdr_size = struct.unpack("<Q", hdr_size_bytes)[0]
+    if hdr_size == 0 or hdr_size > fsize - 8:
+        errors.append(f"invalid safetensors header size ({hdr_size}) in {fn}")
+        continue
+    with open(fpath, "rb") as f:
+        f.seek(8)
+        hdr_bytes = f.read(hdr_size)
+    try:
+        json.loads(hdr_bytes)
+    except Exception:
+        errors.append(f"corrupt safetensors header JSON in {fn}")
+
+if errors:
+    for e in errors:
+        print(f"WARNING: integrity: {e}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+    then
+      _warn "integrity: safetensors header validation failed"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Strategy 3: nonzero weight check (fallback)
+  _verify_nonzero_weights "$dir"
+  return $?
+}
+
 # Deterministic HF cache snapshot selection:
 #   1) refs/main if present and valid
 #   2) otherwise, snapshots sorted newest->oldest by mtime
@@ -313,31 +486,64 @@ _check_model_dir() {
 _check_hf_cache() {
   local base_dir="$1"
   local slug="$2"
+  local requested_revision="${3:-}"
   local cache_dir="$base_dir/hub/models--$slug"
 
   [[ -d "$cache_dir/snapshots" ]] || return 1
 
-  local ref="$cache_dir/refs/main"
+  local ref rev snap snap_dir commit_sha
+
+  if [[ -n "$requested_revision" ]]; then
+    if [[ -d "$cache_dir/snapshots/$requested_revision" ]]; then
+      snap="$cache_dir/snapshots/$requested_revision"
+      if _check_model_dir "$snap" && _check_model_integrity "$snap"; then
+        printf '%s\n%s' "$base_dir" "$requested_revision"
+        return 0
+      fi
+    fi
+    ref="$cache_dir/refs/$requested_revision"
+    if [[ -f "$ref" ]]; then
+      rev="$(<"$ref")"
+      snap="$cache_dir/snapshots/$rev"
+      if [[ -d "$snap" ]] && _check_model_dir "$snap" && _check_model_integrity "$snap"; then
+        printf '%s\n%s' "$base_dir" "$rev"
+        return 0
+      fi
+    fi
+    _CHECK_MODEL_ERR="requested HF revision not present or invalid in cache: $requested_revision"
+    return 1
+  fi
+
+  ref="$cache_dir/refs/main"
   if [[ -f "$ref" ]]; then
-    local rev snap
     rev="$(<"$ref")"
     snap="$cache_dir/snapshots/$rev"
-    if [[ -d "$snap" ]] && _check_model_dir "$snap"; then
-      printf '%s' "$base_dir"
+    if [[ -d "$snap" ]] && _check_model_dir "$snap" && _check_model_integrity "$snap"; then
+      printf '%s\n%s' "$base_dir" "$rev"
       return 0
     fi
   fi
 
-  local snap_dir
   while IFS= read -r snap_dir; do
     [[ -d "$snap_dir" ]] || continue
-    if _check_model_dir "${snap_dir%/}"; then
-      printf '%s' "$base_dir"
+    if _check_model_dir "${snap_dir%/}" && _check_model_integrity "${snap_dir%/}"; then
+      commit_sha="$(basename "${snap_dir%/}")"
+      printf '%s\n%s' "$base_dir" "$commit_sha"
       return 0
     fi
   done < <(ls -td "$cache_dir/snapshots"/*/ 2>/dev/null || true)
 
   return 1
+}
+
+_env_quote_value() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//"/\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
 }
 
 _write_env_atomically() {
@@ -347,6 +553,7 @@ _write_env_atomically() {
   local model_path="${4:-}"
   local resolved_model="$5"
   local resolved_via="$6"
+  local resolved_snapshot="${7:-}"
 
   local env_dir
   env_dir="$(dirname "$env_file")"
@@ -356,16 +563,87 @@ _write_env_atomically() {
   tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
   {
     echo "# generated by vllm-resolve-model"
-    [[ -n "$hf_home" ]] && printf 'export HF_HOME=%q\n' "$hf_home"
-    printf 'export VLLM_MODEL=%q\n' "$VLLM_MODEL"
-    printf 'export VLLM_MODEL_ID=%q\n' "$model_id"
-    [[ -n "$model_path" ]] && printf 'export VLLM_MODEL_PATH=%q\n' "$model_path"
-    printf 'export _VLLM_RESOLVED_MODEL=%q\n' "$resolved_model"
-    printf 'export _VLLM_RESOLVED_VIA=%q\n' "$resolved_via"
+    [[ -n "$hf_home" ]] && printf 'export HF_HOME=%s\n' "$(_env_quote_value "$hf_home")"
+    printf 'export VLLM_MODEL=%s\n' "$(_env_quote_value "$VLLM_MODEL")"
+    printf 'export VLLM_MODEL_ID=%s\n' "$(_env_quote_value "$model_id")"
+    [[ -n "${VLLM_MODEL_REVISION:-}" ]] && printf 'export VLLM_MODEL_REVISION=%s\n' "$(_env_quote_value "$VLLM_MODEL_REVISION")"
+    [[ -n "$model_path" ]] && printf 'export VLLM_MODEL_PATH=%s\n' "$(_env_quote_value "$model_path")"
+    printf 'export _VLLM_MODEL_IDENTITY=%s\n' "$(_env_quote_value "$_model_identity")"
+    [[ -n "$model_path" ]] && printf 'export _VLLM_MODEL_DIR=%s\n' "$(_env_quote_value "$model_path")"
+    [[ -n "$model_path" ]] && printf 'export _VLLM_MODEL_PROVENANCE_FILE=%s\n' "$(_env_quote_value "$model_path/$_provenance_file_name")"
+    printf 'export _VLLM_RESOLVED_MODEL=%s\n' "$(_env_quote_value "$resolved_model")"
+    printf 'export _VLLM_RESOLVED_VIA=%s\n' "$(_env_quote_value "$resolved_via")"
+    [[ -n "$resolved_snapshot" ]] && printf 'export _VLLM_RESOLVED_SNAPSHOT=%s\n' "$(_env_quote_value "$resolved_snapshot")"
   } >"$tmp"
 
   mv -f "$tmp" "$env_file"
   chmod 600 "$env_file" 2>/dev/null || true
+}
+
+_now_utc() {
+  if _has_cmd date; then
+    date -u +%Y-%m-%dT%H:%M:%SZ
+    return 0
+  fi
+  if _has_cmd python3; then
+    python3 - <<'PY'
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+PY
+    return 0
+  fi
+  printf 'unknown'
+}
+
+_write_provenance_file() {
+  local dir="$1"
+  local resolved_via="$2"
+  local detail="${3:-}"
+  local tmp="$dir/${_provenance_file_name}.tmp.$$"
+  {
+    echo "schema=1"
+    echo "complete=1"
+    printf 'model=%s\n' "$VLLM_MODEL"
+    printf 'model_id=%s\n' "$_model_id"
+    printf 'model_identity=%s\n' "$_model_identity"
+    printf 'identity_hash=%s\n' "$_identity_hash12"
+    printf 'model_revision=%s\n' "${VLLM_MODEL_REVISION:-}"
+    printf 'resolved_via=%s\n' "$resolved_via"
+    printf 'detail=%s\n' "$detail"
+    printf 'created_at=%s\n' "$(_now_utc)"
+  } >"$tmp"
+  mv -f "$tmp" "$dir/$_provenance_file_name"
+  chmod 600 "$dir/$_provenance_file_name" 2>/dev/null || true
+}
+
+_read_provenance_value() {
+  local file="$1"
+  local key="$2"
+  local line
+  line="$(grep -m1 -E "^${key}=" "$file" 2>/dev/null || true)"
+  printf '%s' "${line#*=}"
+}
+
+_check_local_provenance() {
+  local dir="$1"
+  local prov="$dir/$_provenance_file_name"
+  [[ -f "$prov" ]] || { _CHECK_MODEL_ERR="missing provenance file $_provenance_file_name"; return 1; }
+
+  local complete model model_id identity_hash revision identity
+  complete="$(_read_provenance_value "$prov" complete)"
+  model="$(_read_provenance_value "$prov" model)"
+  model_id="$(_read_provenance_value "$prov" model_id)"
+  identity="$(_read_provenance_value "$prov" model_identity)"
+  identity_hash="$(_read_provenance_value "$prov" identity_hash)"
+  revision="$(_read_provenance_value "$prov" model_revision)"
+
+  [[ "$complete" == "1" ]] || { _CHECK_MODEL_ERR="provenance file is not marked complete"; return 1; }
+  [[ "$model" == "$VLLM_MODEL" ]] || { _CHECK_MODEL_ERR="provenance basename mismatch (found: $model)"; return 1; }
+  [[ "$model_id" == "$_model_id" ]] || { _CHECK_MODEL_ERR="provenance model_id mismatch (found: $model_id expected: $_model_id)"; return 1; }
+  [[ "$identity" == "$_model_identity" ]] || { _CHECK_MODEL_ERR="provenance identity mismatch"; return 1; }
+  [[ "$identity_hash" == "$_identity_hash12" ]] || { _CHECK_MODEL_ERR="provenance identity hash mismatch (found: $identity_hash expected: $_identity_hash12)"; return 1; }
+  [[ "$revision" == "${VLLM_MODEL_REVISION:-}" ]] || { _CHECK_MODEL_ERR="provenance revision mismatch (found: $revision expected: ${VLLM_MODEL_REVISION:-})"; return 1; }
+  return 0
 }
 
 _restore_backup_if_missing() {
@@ -418,27 +696,33 @@ _hf_download_repo_to_dir() {
   local repo_id="$1"
   local out_dir="$2"
   local log="$3"
+  local revision="${4:-}"
+  local rev_args=()
+  [[ -n "$revision" ]] && rev_args+=(--revision "$revision")
 
   if _has_cmd hf; then
-    _run_to_log "$log" hf download "$repo_id" --local-dir "$out_dir"
+    _run_to_log "$log" hf download "$repo_id" --local-dir "$out_dir" "${rev_args[@]}"
     return $?
   fi
 
   if _has_cmd huggingface-cli; then
-    if _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir" --local-dir-use-symlinks False; then
+    if _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir" --local-dir-use-symlinks False "${rev_args[@]}"; then
       return 0
     fi
-    _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir"
+    _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir" "${rev_args[@]}"
     return $?
   fi
 
   if _has_cmd python3; then
     : >"$log"
-    python3 - "$repo_id" "$out_dir" >>"$log" 2>&1 <<'PY'
+    python3 - "$repo_id" "$out_dir" "$revision" >>"$log" 2>&1 <<'PY'
 import sys
-repo_id, out_dir = sys.argv[1], sys.argv[2]
+repo_id, out_dir, revision = sys.argv[1], sys.argv[2], sys.argv[3]
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id=repo_id, local_dir=out_dir, local_dir_use_symlinks=False)
+kwargs = dict(repo_id=repo_id, local_dir=out_dir, local_dir_use_symlinks=False)
+if revision:
+    kwargs["revision"] = revision
+snapshot_download(**kwargs)
 print(out_dir)
 PY
     return $?
@@ -456,13 +740,12 @@ _validate_model_name "$VLLM_MODEL"
 
 VLLM_MODEL_ID="${VLLM_MODEL_ID:-}"
 VLLM_MODEL_ORG="${VLLM_MODEL_ORG:-}"
+VLLM_MODEL_REVISION="${VLLM_MODEL_REVISION:-}"
 VLLM_MODEL_SOURCES="${VLLM_MODEL_SOURCES:-flox,local,hf-cache,r2,hf-hub}"
 VLLM_RESOLVE_LOCK_TIMEOUT="${VLLM_RESOLVE_LOCK_TIMEOUT:-300}"
+R2_MODEL_OBJECT_PREFIX="${R2_MODEL_OBJECT_PREFIX:-}"
 
 mkdir -p "$VLLM_MODELS_DIR"
-
-_target_dir="$VLLM_MODELS_DIR/$VLLM_MODEL"
-_restore_backup_if_missing "$_target_dir"
 
 _model_id=""
 if [[ -z "$VLLM_MODEL_ID" ]]; then
@@ -472,30 +755,62 @@ else
   _model_id="$VLLM_MODEL_ID"
 fi
 
+_model_identity="$_model_id"
+if [[ -n "$VLLM_MODEL_REVISION" ]]; then
+  _model_identity+="@${VLLM_MODEL_REVISION}"
+fi
+
 # Slug for filenames (safe chars only)
 _model_slug="$(_slugify "$_model_id")"
 # HF cache slug: HuggingFace uses "models--org--name" directory convention
 _hf_slug="${_model_id//\//-\-}"
+_provenance_file_name=".vllm-model-provenance"
 
-# Per-model env file by default (prevents cross-model stale-cache incidents)
+if _identity_hash12="$(_sha256_12 "$_model_identity")"; then
+  :
+else
+  _die "Unable to compute model identity hash"
+fi
+
+_target_dir="$VLLM_MODELS_DIR/${VLLM_MODEL}.${_identity_hash12}"
+_legacy_target_dir="$VLLM_MODELS_DIR/$VLLM_MODEL"
+_restore_backup_if_missing "$_target_dir"
+
+# Per-model env file by default, keyed by full model identity
+# (model_id plus @revision when VLLM_MODEL_REVISION is set).
 VLLM_MODEL_ENV_FILE="${VLLM_MODEL_ENV_FILE:-}"
 if [[ -z "$VLLM_MODEL_ENV_FILE" ]]; then
   : "${FLOX_ENV_CACHE:?Set FLOX_ENV_CACHE or override VLLM_MODEL_ENV_FILE}"
-  if _hash12="$(_sha256_12 "$_model_id")"; then
-    VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${_model_slug}.${_hash12}.env"
-  else
-    VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${_model_slug}.env"
-  fi
+  VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${_model_slug}.${_identity_hash12}.env"
 fi
 _model_env="$VLLM_MODEL_ENV_FILE"
 
-# Ensure env dir exists before opening lock file (redirect would fail otherwise)
+# Ensure dirs exist before opening lock file (redirect would fail otherwise)
 mkdir -p "$(dirname "$_model_env")"
+mkdir -p "$VLLM_MODELS_DIR/.locks"
 
-# Lock per-model.
-_lock_file="${_model_env}.lock"
-_lock_dir="${_model_env}.lockdir"
+# Lock on the mutable target directory identity, not only the env file.
+_lock_file="$VLLM_MODELS_DIR/.locks/vllm-model.${_identity_hash12}.lock"
+_lock_dir="$VLLM_MODELS_DIR/.locks/vllm-model.${_identity_hash12}.lockdir"
 _lock_mode=""
+
+_try_reclaim_stale_lockdir() {
+  local pid_file="$_lock_dir/pid"
+  local host_file="$_lock_dir/host"
+  local holder_pid holder_host current_host
+  [[ -d "$_lock_dir" ]] || return 1
+  [[ -f "$pid_file" && -f "$host_file" ]] || return 1
+  holder_pid="$(<"$pid_file")"
+  holder_host="$(<"$host_file")"
+  current_host="$(hostname 2>/dev/null || printf 'unknown')"
+  [[ "$holder_host" == "$current_host" ]] || return 1
+  [[ "$holder_pid" =~ ^[0-9]+$ ]] || return 1
+  if kill -0 "$holder_pid" 2>/dev/null; then
+    return 1
+  fi
+  rm -rf "$_lock_dir" 2>/dev/null || return 1
+  return 0
+}
 
 _acquire_lock() {
   if _has_cmd flock; then
@@ -508,7 +823,14 @@ _acquire_lock() {
   _lock_mode="mkdir"
   local i
   for ((i=0; i<VLLM_RESOLVE_LOCK_TIMEOUT; i++)); do
-    mkdir "$_lock_dir" 2>/dev/null && return 0
+    if mkdir "$_lock_dir" 2>/dev/null; then
+      printf '%s
+' "$$" >"$_lock_dir/pid"
+      hostname 2>/dev/null >"$_lock_dir/host" || printf 'unknown
+' >"$_lock_dir/host"
+      return 0
+    fi
+    _try_reclaim_stale_lockdir || true
     sleep 1
   done
   _die "lock timeout: $_lock_dir"
@@ -516,7 +838,7 @@ _acquire_lock() {
 
 _release_lock() {
   if [[ "$_lock_mode" == "mkdir" ]]; then
-    rmdir "$_lock_dir" 2>/dev/null || true
+    rm -rf "$_lock_dir" 2>/dev/null || true
   fi
 }
 
@@ -576,40 +898,47 @@ for _src in "${_sources[@]}"; do
         _add_error "flox: FLOX_ENV not set"
         continue
       fi
-      if _hf_home=$(_check_hf_cache "$FLOX_ENV/share/models" "$_hf_slug"); then
-        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "flox"
+      if _hf_output=$(_check_hf_cache "$FLOX_ENV/share/models" "$_hf_slug" "$VLLM_MODEL_REVISION"); then
+        _hf_home="$(head -n1 <<< "$_hf_output")"
+        _hf_snapshot="$(tail -n1 <<< "$_hf_output")"
+        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "flox" "$_hf_snapshot"
         _resolved_via="flox"; _resolved_model="$_model_id"; _did_resolve=1
         echo "OK"
         break
       else
         echo "not found"
-        _add_error "flox: no usable HF snapshot at \$FLOX_ENV/share/models/hub/models--${_hf_slug}/"
+        _add_error "flox: no usable HF snapshot at \$FLOX_ENV/share/models/hub/models--${_hf_slug}/ for revision ${VLLM_MODEL_REVISION:-<latest>}"
       fi
       ;;
 
     local)
       printf "[model] Checking local directory... "
-      if _check_model_dir "$_target_dir"; then
+      if _check_model_dir "$_target_dir" && _check_local_provenance "$_target_dir" && _check_model_integrity "$_target_dir"; then
         _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "local"
         _resolved_via="local"; _resolved_model="$_target_dir"; _did_resolve=1
         echo "OK"
         break
       else
         echo "not found"
-        _add_error "local: $_target_dir failed validation: ${_CHECK_MODEL_ERR}"
+        if [[ -d "$_legacy_target_dir" && "$_legacy_target_dir" != "$_target_dir" ]]; then
+          _add_error "local: legacy path exists at $_legacy_target_dir but identity-scoped local path is $_target_dir; reprovision or migrate the directory with a matching provenance file"
+        fi
+        _add_error "local: $_target_dir failed validation/provenance check: ${_CHECK_MODEL_ERR}"
       fi
       ;;
 
     hf-cache)
       printf "[model] Checking HF cache... "
-      if _hf_home=$(_check_hf_cache "$VLLM_MODELS_DIR" "$_hf_slug"); then
-        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "hf-cache"
+      if _hf_output=$(_check_hf_cache "$VLLM_MODELS_DIR" "$_hf_slug" "$VLLM_MODEL_REVISION"); then
+        _hf_home="$(head -n1 <<< "$_hf_output")"
+        _hf_snapshot="$(tail -n1 <<< "$_hf_output")"
+        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "hf-cache" "$_hf_snapshot"
         _resolved_via="hf-cache"; _resolved_model="$_model_id"; _did_resolve=1
         echo "OK"
         break
       else
         echo "not found"
-        _add_error "hf-cache: no usable HF snapshot at $VLLM_MODELS_DIR/hub/models--${_hf_slug}/ (last check: ${_CHECK_MODEL_ERR:-unknown})"
+        _add_error "hf-cache: no usable HF snapshot at $VLLM_MODELS_DIR/hub/models--${_hf_slug}/ for revision ${VLLM_MODEL_REVISION:-<latest>} (last check: ${_CHECK_MODEL_ERR:-unknown})"
       fi
       ;;
 
@@ -626,15 +955,18 @@ for _src in "${_sources[@]}"; do
         continue
       fi
 
+      _r2_model_prefix="$R2_MODELS_PREFIX/$VLLM_MODEL"
+      if [[ -n "$R2_MODEL_OBJECT_PREFIX" ]]; then
+        _r2_model_prefix="$R2_MODEL_OBJECT_PREFIX"
+      fi
+      _r2_model_prefix="${_r2_model_prefix%/}"
+
       _aws_endpoint_args=()
       [[ -n "${R2_ENDPOINT_URL:-}" ]] && _aws_endpoint_args+=(--endpoint-url "$R2_ENDPOINT_URL")
 
-      if ! aws "${_aws_endpoint_args[@]}" sts get-caller-identity >/dev/null 2>&1; then
-        echo "failed (no credentials)"
-        _add_error "r2: aws sts get-caller-identity failed (credentials/config)"
-        continue
-      fi
-
+      # Do not probe R2 with AWS STS. R2 presents an S3-compatible object API,
+      # and the real operation we depend on is `aws s3 sync`. Let that command
+      # be the source of truth for credentials, endpoint, and bucket access.
       _restore_backup_if_missing "$_target_dir"
 
       stage_dir="$(_mk_stage_dir "$_stage_base" "${VLLM_MODEL}.r2")"
@@ -644,11 +976,12 @@ for _src in "${_sources[@]}"; do
       _logfiles+=("$logfile")
 
       if _run_to_log "$logfile" aws "${_aws_endpoint_args[@]}" s3 sync \
-          "s3://$R2_BUCKET/$R2_MODELS_PREFIX/$VLLM_MODEL/" \
+          "s3://$R2_BUCKET/${_r2_model_prefix#/}/" \
           "$stage_dir/" \
           --no-progress; then
 
-        if _check_model_dir "$stage_dir"; then
+        if _check_model_dir "$stage_dir" && _check_model_integrity "$stage_dir"; then
+          _write_provenance_file "$stage_dir" "r2" "${_r2_model_prefix#/}"
           : >"$stage_dir/.complete"
           if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
             _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "r2"
@@ -665,7 +998,7 @@ for _src in "${_sources[@]}"; do
         fi
       else
         echo "failed (sync error)"
-        _add_error "r2: aws s3 sync failed — tail: $(_tail_one_line "$logfile" 80) (full log: $logfile)"
+        _add_error "r2: aws s3 sync failed (credentials, endpoint, bucket access, or object error) — tail: $(_tail_one_line "$logfile" 80) (full log: $logfile)"
       fi
 
       # Avoid stage-dir leaks across multiple remote attempts in one run.
@@ -683,8 +1016,9 @@ for _src in "${_sources[@]}"; do
       logfile="$(mktemp "$_stage_base/${VLLM_MODEL}.hf.log.XXXXXX")"
       _logfiles+=("$logfile")
 
-      if _hf_download_repo_to_dir "$_model_id" "$stage_dir" "$logfile"; then
-        if _check_model_dir "$stage_dir"; then
+      if _hf_download_repo_to_dir "$_model_id" "$stage_dir" "$logfile" "$VLLM_MODEL_REVISION"; then
+        if _check_model_dir "$stage_dir" && _check_model_integrity "$stage_dir"; then
+          _write_provenance_file "$stage_dir" "hf-hub" "${VLLM_MODEL_REVISION:-}"
           : >"$stage_dir/.complete"
           if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
             _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "hf-hub"
