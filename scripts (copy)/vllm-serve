@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# vllm-serve — Load resolved model env and exec `vllm serve` with validated args.
+#
+# Required env:
+#   If VLLM_MODEL_ENV_FILE is NOT set:
+#     FLOX_ENV_CACHE              Cache directory (used to derive the env file path)
+#     and either:
+#       VLLM_MODEL_ID             Full model id (e.g. org/model), OR
+#       VLLM_MODEL_ORG + VLLM_MODEL
+#
+#   Always required:
+#     FLOX_ENV_PROJECT            Project root (unless VLLM_CONFIG_FILE is set)
+#     VLLM_HOST                   Bind address (non-empty)
+#     VLLM_PORT                   Listen port (> 0)
+#     VLLM_TENSOR_PARALLEL_SIZE   > 0
+#     VLLM_PIPELINE_PARALLEL_SIZE > 0
+#     VLLM_KV_CACHE_DTYPE         non-empty (no whitespace)
+#     VLLM_MAX_MODEL_LEN          > 0
+#     VLLM_MAX_NUM_BATCHED_TOKENS > 0
+#     VLLM_SERVED_MODEL_NAME      non-empty
+#
+# Optional env:
+#   VLLM_MODEL_ENV_FILE           Explicit env-file path (bypasses FLOX_ENV_CACHE/model id derivation)
+#   VLLM_PREFIX_CACHING           true/false/1/0/yes/no (default: false)
+#   VLLM_CONFIG_FILE              Override config path (default: $FLOX_ENV_PROJECT/config.yaml)
+#   VLLM_ENV_FILE_TRUSTED         true/false/1/0/yes/no (default: false)
+#
+# SAFE env-file contract:
+#   In SAFE mode (default), the env file must be a restricted .env subset:
+#     - Lines: KEY=VALUE or "export KEY=VALUE"
+#     - Optional quotes: KEY="value" or KEY='value'
+#     - Optional trailing comments after quoted values: KEY="value" # comment
+#     - No multiline values, no ${VAR} interpolation, no command substitution.
+#   This is intended to match the output of vllm-resolve-model. Treat the env file as a trust boundary
+#   because it can still set arbitrary environment variables (e.g. PATH, LD_LIBRARY_PATH, HF_HOME).
+#
+# The env file must define:
+#   _VLLM_RESOLVED_MODEL
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+on_err() {
+  local ec=$?
+  err "vllm-serve failed (exit=$ec) at line ${1}: ${2}"
+  exit "$ec"
+}
+trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+
+require_nonempty() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
+}
+
+require_pos_int() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
+  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a positive integer, got: $val"; exit 2; }
+  [[ "$val" -gt 0 ]] || { err "$name must be > 0, got: $val"; exit 2; }
+}
+
+print_help() {
+  cat <<'EOF'
+Usage: vllm-serve [--print-cmd] [--dry-run] [--] [vllm args...]
+
+Script flags:
+  --print-cmd   Print the final `vllm serve ...` argv to stderr before exec
+  --dry-run     Print the final argv and exit 0 (do not exec)
+  -h, --help    Show help
+
+Everything after `--` passes through to vLLM.
+EOF
+}
+
+# -----------------------------
+# Script flags
+# -----------------------------
+PRINT_CMD=0
+DRY_RUN=0
+VLLM_EXTRA_ARGS=()
+
+while (($#)); do
+  case "$1" in
+    --print-cmd) PRINT_CMD=1; shift ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    -h|--help)   print_help; exit 0 ;;
+    --)          shift; VLLM_EXTRA_ARGS+=("$@"); break ;;
+    *)           VLLM_EXTRA_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Defaults (avoid nounset exits)
+VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-false}"
+VLLM_ENV_FILE_TRUSTED="${VLLM_ENV_FILE_TRUSTED:-false}"
+
+# Ensure vllm exists early
+command -v vllm >/dev/null 2>&1 || die "'vllm' not found in PATH"
+
+# -----------------------------
+# Helpers: python + hash + slug
+# -----------------------------
+pick_python() {
+  if command -v python3 >/dev/null 2>&1; then echo python3; return 0; fi
+  if command -v python  >/dev/null 2>&1; then echo python;  return 0; fi
+  return 1
+}
+
+sha256_12() {
+  # prints first 12 hex chars of sha256(input)
+  local input="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$input" | sha256sum | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$input" | shasum -a 256 | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$input" | openssl dgst -sha256 | awk '{print substr($NF,1,12)}'
+    return 0
+  fi
+  local py
+  if py="$(pick_python)"; then
+    "$py" - "$input" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:12])
+PY
+    return 0
+  fi
+  return 1
+}
+
+slugify() {
+  # keep only A-Za-z0-9._- ; map everything else to '-'
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'
+}
+
+# -----------------------------
+# Resolve env-file path
+# -----------------------------
+LEGACY_ENV_FILE=""
+if [[ -z "${VLLM_MODEL_ENV_FILE:-}" ]]; then
+  require_nonempty FLOX_ENV_CACHE
+  [[ -d "$FLOX_ENV_CACHE" ]] || { err "FLOX_ENV_CACHE is not a directory: $FLOX_ENV_CACHE"; exit 2; }
+
+  _model_id="${VLLM_MODEL_ID:-}"
+  if [[ -z "$_model_id" ]]; then
+    require_nonempty VLLM_MODEL_ORG
+    require_nonempty VLLM_MODEL
+    _model_id="$VLLM_MODEL_ORG/$VLLM_MODEL"
+  fi
+
+  slug="$(slugify "$_model_id")"
+  LEGACY_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${slug}.env"
+
+  if hash12="$(sha256_12 "$_model_id")"; then
+    VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${slug}.${hash12}.env"
+  else
+    VLLM_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
+  fi
+
+  if [[ ! -f "$VLLM_MODEL_ENV_FILE" && -n "$LEGACY_ENV_FILE" && -f "$LEGACY_ENV_FILE" ]]; then
+    VLLM_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
+  fi
+fi
+
+if [[ ! -f "$VLLM_MODEL_ENV_FILE" ]]; then
+  err "Model env file not found: $VLLM_MODEL_ENV_FILE"
+  if [[ -n "${LEGACY_ENV_FILE:-}" && "$LEGACY_ENV_FILE" != "$VLLM_MODEL_ENV_FILE" ]]; then
+    err "Also tried legacy path: $LEGACY_ENV_FILE"
+  fi
+  err "Run vllm-resolve-model first (or set VLLM_MODEL_ENV_FILE)."
+  exit 1
+fi
+[[ -r "$VLLM_MODEL_ENV_FILE" ]] || die "Model env file not readable: $VLLM_MODEL_ENV_FILE"
+
+# -----------------------------
+# Load env file
+# -----------------------------
+tmp_env=""
+cleanup() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
+trap cleanup EXIT
+
+load_env_file_safe() {
+  local f="$1"
+  local py
+  py="$(pick_python)" || die "SAFE env loading requires python3/python. Install it or set VLLM_ENV_FILE_TRUSTED=true (code execution)."
+
+  tmp_env="$(mktemp -t vllm_env_exports.XXXXXX)"
+
+  "$py" - "$f" >"$tmp_env" <<'PY'
+import sys, re, shlex
+
+path = sys.argv[1]
+out = []
+
+line_re = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+
+def parse_quoted(rest: str):
+    q = rest[0]
+    i = 1
+    buf = []
+    if q == "'":
+        while i < len(rest):
+            c = rest[i]
+            if c == "'":
+                i += 1
+                break
+            buf.append(c)
+            i += 1
+        else:
+            raise SystemExit("Unterminated single-quoted value")
+        val = "".join(buf)
+        tail = rest[i:]
+        return val, tail
+    # double-quoted: minimal escapes
+    while i < len(rest):
+        c = rest[i]
+        if c == '"':
+            i += 1
+            break
+        if c == '\\':
+            i += 1
+            if i >= len(rest):
+                buf.append('\\')
+                break
+            e = rest[i]
+            if e == 'n': buf.append('\n')
+            elif e == 't': buf.append('\t')
+            elif e == '"': buf.append('"')
+            elif e == '\\': buf.append('\\')
+            else: buf.append(e)
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    else:
+        raise SystemExit("Unterminated double-quoted value")
+    val = "".join(buf)
+    tail = rest[i:]
+    return val, tail
+
+def strip_unquoted_inline_comment(s: str) -> str:
+    m = re.match(r'^(.*?)(?:\s+#.*)?$', s)
+    return (m.group(1) if m else s).rstrip()
+
+with open(path, 'r', encoding='utf-8') as fh:
+    for raw in fh:
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        m = line_re.match(line)
+        if not m:
+            raise SystemExit(f"Unsupported env line (expected KEY=VALUE): {raw.rstrip()}")
+
+        key, rest = m.group(1), m.group(2).lstrip()
+
+        if rest.startswith(("'", '"')):
+            val, tail = parse_quoted(rest)
+            tail = tail.strip()
+            if tail and not tail.startswith('#'):
+                raise SystemExit(f"Unexpected trailing characters after quoted value: {raw.rstrip()}")
+        else:
+            val = strip_unquoted_inline_comment(rest)
+
+        out.append(f"export {key}={shlex.quote(val)}")
+
+sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+PY
+
+  # Source only generated export lines. Relax nounset around the source to reduce surprise.
+  set -a
+  set +u
+  # shellcheck disable=SC1090
+  source "$tmp_env"
+  set -u
+  set +a
+
+  # IMPORTANT: exec below replaces the shell, so EXIT traps won't run on success.
+  # Clean the temp file immediately on the success path.
+  rm -f "$tmp_env"
+  tmp_env=""
+}
+
+load_env_file_trusted() {
+  # TRUSTED mode executes the env file as shell code.
+  local f="$1"
+  set -a
+  set +u
+  # shellcheck disable=SC1090
+  source "$f"
+  set -u
+  set +a
+}
+
+case "${VLLM_ENV_FILE_TRUSTED,,}" in
+  true|1|yes)  load_env_file_trusted "$VLLM_MODEL_ENV_FILE" ;;
+  false|0|no|'') load_env_file_safe "$VLLM_MODEL_ENV_FILE" ;;
+  *) err "VLLM_ENV_FILE_TRUSTED must be true/false/1/0/yes/no, got: $VLLM_ENV_FILE_TRUSTED"; exit 2 ;;
+esac
+
+[[ -n "${_VLLM_RESOLVED_MODEL:-}" ]] || die "Env file did not set _VLLM_RESOLVED_MODEL: $VLLM_MODEL_ENV_FILE"
+
+# -----------------------------
+# Validate required config/env
+# -----------------------------
+require_nonempty VLLM_HOST
+require_pos_int VLLM_PORT
+require_pos_int VLLM_TENSOR_PARALLEL_SIZE
+require_pos_int VLLM_PIPELINE_PARALLEL_SIZE
+require_pos_int VLLM_MAX_MODEL_LEN
+require_pos_int VLLM_MAX_NUM_BATCHED_TOKENS
+require_nonempty VLLM_SERVED_MODEL_NAME
+require_nonempty VLLM_KV_CACHE_DTYPE
+
+if [[ "$VLLM_KV_CACHE_DTYPE" =~ [[:space:]] ]]; then
+  err "VLLM_KV_CACHE_DTYPE must not contain whitespace, got: $VLLM_KV_CACHE_DTYPE"
+  exit 2
+fi
+
+_config_file="${VLLM_CONFIG_FILE:-}"
+if [[ -z "$_config_file" ]]; then
+  require_nonempty FLOX_ENV_PROJECT
+  [[ -d "$FLOX_ENV_PROJECT" ]] || { err "FLOX_ENV_PROJECT is not a directory: $FLOX_ENV_PROJECT"; exit 2; }
+  _config_file="$FLOX_ENV_PROJECT/config.yaml"
+fi
+[[ -f "$_config_file" ]] || die "Config file not found: $_config_file"
+[[ -r "$_config_file" ]] || die "Config file not readable: $_config_file"
+
+# -----------------------------
+# Build argv
+# -----------------------------
+cmd=(
+  vllm serve "$_VLLM_RESOLVED_MODEL"
+  --config "$_config_file"
+  --host "$VLLM_HOST"
+  --port "$VLLM_PORT"
+  --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
+  --pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
+  --kv-cache-dtype "$VLLM_KV_CACHE_DTYPE"
+  --max-model-len "$VLLM_MAX_MODEL_LEN"
+  --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
+  --served-model-name "$VLLM_SERVED_MODEL_NAME"
+)
+
+case "${VLLM_PREFIX_CACHING,,}" in
+  true|1|yes)  cmd+=(--enable-prefix-caching) ;;
+  false|0|no|'') : ;;
+  *) err "VLLM_PREFIX_CACHING must be true/false/1/0/yes/no, got: $VLLM_PREFIX_CACHING"; exit 2 ;;
+esac
+
+if ((${#VLLM_EXTRA_ARGS[@]})); then
+  cmd+=("${VLLM_EXTRA_ARGS[@]}")
+fi
+
+if ((PRINT_CMD || DRY_RUN)); then
+  printf 'CMD:' >&2
+  for a in "${cmd[@]}"; do printf ' %q' "$a" >&2; done
+  printf '\n' >&2
+fi
+
+if ((DRY_RUN)); then
+  exit 0
+fi
+
+exec "${cmd[@]}"

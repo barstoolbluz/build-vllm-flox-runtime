@@ -1,8 +1,14 @@
 { stdenv, lib }:
 
+let
+  buildMeta = builtins.fromJSON (builtins.readFile ../../build-meta/vllm-flox-runtime.json);
+  buildVersion = buildMeta.build_version;
+  version = "0.9.1";
+in
+
 stdenv.mkDerivation {
   pname = "vllm-flox-runtime";
-  version = "0.9.1";
+  inherit version;
 
   src = ../../scripts;
 
@@ -15,11 +21,14 @@ stdenv.mkDerivation {
     done
 
     mkdir -p $out/share/vllm-flox-runtime
-    cat > "$out/share/vllm-flox-runtime/vllm-flox-runtime-$version" <<'MARKER'
-    Initial release of vllm-flox-runtime scripts.
-    - vllm-serve: model env loading and validated vllm serve execution
-    - vllm-preflight: port reclaim, GPU health check, downstream exec
-    - vllm-resolve-model: multi-source model provisioning (flox, local, hf-cache, r2, hf-hub)
+    cat > $out/share/vllm-flox-runtime/flox-build-version-${toString buildVersion} <<'MARKER'
+    build-version: ${toString buildVersion}
+    upstream-version: ${version}
+    upstream-tag: ${version}
+    git-rev: ${buildMeta.git_rev}
+    git-rev-short: ${buildMeta.git_rev_short}
+    force-increment: ${toString buildMeta.force_increment}
+    changelog: ${buildMeta.changelog}
     MARKER
   '';
 

@@ -1,0 +1,736 @@
+#!/usr/bin/env bash
+# vllm-resolve-model — Multi-source model provisioning (hardened, cache-safe).
+#
+# Required:
+#   VLLM_MODEL         — model name (used as local dir name; must be a single safe path element)
+#   VLLM_MODELS_DIR    — base dir for local models and optional HF cache
+#
+# Optional:
+#   VLLM_MODEL_ID      — explicit HF model ID (org/name); derived if empty
+#   VLLM_MODEL_ORG     — org prefix when deriving model ID from VLLM_MODEL
+#   VLLM_MODEL_SOURCES — comma-separated source order (default: flox,local,hf-cache,r2,hf-hub)
+#
+#   FLOX_ENV           — Flox environment path (for flox source)
+#   FLOX_ENV_CACHE     — cache directory (used to place env files by default)
+#   VLLM_MODEL_ENV_FILE — override env file path
+#     default: $FLOX_ENV_CACHE/vllm-model.<model_slug>.env   (per-model => no cross-model staleness)
+#
+#   R2_BUCKET          — Cloudflare R2 bucket name (for r2 source)
+#   R2_MODELS_PREFIX   — R2 key prefix for models (for r2 source)
+#   R2_ENDPOINT_URL    — optional AWS CLI endpoint URL (for r2 source)
+#
+#   VLLM_RESOLVE_LOCK_TIMEOUT — seconds to wait for lock (default: 300)
+#   VLLM_SKIP_TOKENIZER_CHECK — set to 1 to skip tokenizer asset checks
+#
+# Logging:
+#   By default, the script KEEPS logs on failure and deletes logs on success.
+#   Set VLLM_KEEP_LOGS=1 to always keep logs (also on success).
+#
+# Output:
+#   Writes an env file exporting:
+#     HF_HOME (when applicable)
+#     VLLM_MODEL, VLLM_MODEL_ID, VLLM_MODEL_PATH (when local), _VLLM_RESOLVED_MODEL, _VLLM_RESOLVED_VIA
+#
+# Notes:
+# - The script NEVER "succeeds" by reusing an existing env file unless it resolved in the current run.
+# - For r2 and hf-hub sources, it stages into a temp dir and swaps into place after validation.
+#
+# Permissions:
+# - The script writes env files with private permissions by default (umask 077; chmod 600).
+
+set -euo pipefail
+umask 077
+
+_die() { echo "ERROR: $*" >&2; exit 1; }
+_warn() { echo "WARNING: $*" >&2; }
+
+_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+_has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+_slugify() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'
+}
+
+_sha256_12() {
+  local input="$1"
+  if _has_cmd sha256sum; then
+    printf '%s' "$input" | sha256sum | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if _has_cmd shasum; then
+    printf '%s' "$input" | shasum -a 256 | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if _has_cmd openssl; then
+    printf '%s' "$input" | openssl dgst -sha256 | awk '{print substr($NF,1,12)}'
+    return 0
+  fi
+  if _has_cmd python3; then
+    python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest()[:12])" "$input"
+    return 0
+  fi
+  return 1
+}
+
+# Require VLLM_MODEL to be a single safe path element.
+_validate_model_name() {
+  local name="$1"
+  [[ -n "$name" ]] || _die "VLLM_MODEL is empty"
+  [[ "$name" != */* ]] || _die "VLLM_MODEL must not contain '/': $name"
+  [[ "$name" != *'\'* ]] || _die "VLLM_MODEL must not contain '\\': $name"
+  [[ "$name" != "." && "$name" != ".." ]] || _die "VLLM_MODEL must not be '.' or '..': $name"
+  [[ "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] || _die "VLLM_MODEL must not contain control whitespace"
+}
+
+_run_to_log() {
+  # Usage: _run_to_log <logfile> <cmd...>
+  local log="$1"; shift
+  : >"$log"
+  "$@" >>"$log" 2>&1
+}
+
+_tail_one_line() {
+  local log="$1"
+  local n="${2:-80}"
+  tail -n "$n" "$log" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g'
+}
+
+# Globals for richer diagnostics from _check_model_dir.
+_CHECK_MODEL_ERR=""
+
+# Parse HF shard index JSON and verify referenced shard files exist.
+# Returns:
+#   0 complete
+#   1 missing shards
+#   2 unparseable index
+# Prints missing shard filenames to stdout (one per line) on rc=1.
+_check_shard_index_complete() {
+  local dir="$1"
+  local idx="$2"
+
+  if _has_cmd python3; then
+    python3 - "$dir" "$idx" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+idx = sys.argv[2]
+try:
+  data = json.load(open(idx, "r", encoding="utf-8"))
+except Exception:
+  sys.exit(2)
+wm = data.get("weight_map") or {}
+if not isinstance(wm, dict):
+  sys.exit(2)
+req = sorted(set(wm.values()))
+missing = [f for f in req if not os.path.exists(os.path.join(d, f))]
+if missing:
+  for f in missing[:2000]:
+    print(f)
+  sys.exit(1)
+sys.exit(0)
+PY
+    return $?
+  fi
+
+  # Fallback heuristic if python3 is unavailable:
+  mapfile -t shards < <(grep -oE '"[^"]+\.(safetensors|bin|pt|pth|gguf)"' "$idx" 2>/dev/null \
+    | tr -d '"' | sort -u)
+
+  if (( ${#shards[@]} == 0 )); then
+    return 2
+  fi
+
+  local miss=0
+  for f in "${shards[@]}"; do
+    [[ -f "$dir/$f" ]] || { echo "$f"; miss=1; }
+  done
+  [[ $miss -eq 0 ]] && return 0 || return 1
+}
+
+# Tokenizer assets check (best-effort; widened for common layouts).
+_check_tokenizer_assets() {
+  local dir="$1"
+  [[ "${VLLM_SKIP_TOKENIZER_CHECK:-0}" == "1" ]] && return 0
+
+  local candidates=("$dir" "$dir/tokenizer" "$dir/tokenizer_files")
+  local d
+  for d in "${candidates[@]}"; do
+    [[ -d "$d" ]] || continue
+    if [[ -f "$d/tokenizer.json" || -f "$d/tokenizer.model" || -f "$d/spiece.model" ]]; then
+      return 0
+    fi
+    if [[ -f "$d/vocab.json" && -f "$d/merges.txt" ]]; then
+      return 0
+    fi
+    if [[ -f "$d/vocab.txt" ]]; then
+      return 0
+    fi
+    if [[ -f "$d/tokenizer_config.json" && ( -f "$d/vocab.json" || -f "$d/vocab.txt" ) ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Heuristic for shard sets with no *.index.json:
+# If we detect *-00001-of-000NN.ext, we require all shards 1..NN exist for that prefix/ext.
+_check_of_shards_complete_no_index() {
+  local dir="$1"
+  local any=0
+  local candidate bn prefix part_str total_str ext width total part need
+  shopt -s nullglob
+  local files=( "$dir"/*-00001-of-*.safetensors "$dir"/*-00001-of-*.bin "$dir"/*-00001-of-*.pt "$dir"/*-00001-of-*.pth "$dir"/*-00001-of-*.gguf )
+  shopt -u nullglob
+
+  for candidate in "${files[@]}"; do
+    [[ -f "$candidate" ]] || continue
+    bn="$(basename "$candidate")"
+    # prefix-00001-of-00012.safetensors
+    if [[ "$bn" =~ ^(.*)-([0-9]+)-of-([0-9]+)\.([A-Za-z0-9]+)$ ]]; then
+      prefix="${BASH_REMATCH[1]}"
+      part_str="${BASH_REMATCH[2]}"
+      total_str="${BASH_REMATCH[3]}"
+      ext="${BASH_REMATCH[4]}"
+      [[ "$part_str" == "00001" || "$part_str" == "000001" || "$part_str" == "1" ]] || continue
+
+      any=1
+      width="${#part_str}"
+      total=$((10#$total_str))
+
+      # Guard against insane totals
+      (( total > 0 && total < 100000 )) || { echo "<bad shard count: $bn>"; return 1; }
+
+      local missing=()
+      for ((part=1; part<=total; part++)); do
+        part_str="$(printf "%0${width}d" "$part")"
+        need="$dir/${prefix}-${part_str}-of-${total_str}.${ext}"
+        [[ -f "$need" ]] || missing+=("$(basename "$need")")
+      done
+
+      if (( ${#missing[@]} == 0 )); then
+        return 0
+      else
+        printf '%s\n' "${missing[@]}" | head -n 2000
+        return 1
+      fi
+    fi
+  done
+
+  # No shard pattern detected => caller decides.
+  (( any == 0 )) && return 2
+  return 1
+}
+
+# Minimum viability for vLLM:
+#   - config.json
+#   - tokenizer assets (unless skipped)
+#   - weights:
+#       - if an index exists (*.index.json), verify all referenced shard files exist
+#       - else require at least one weight-like file; if we detect "-00001-of-000NN", require full set
+_check_model_dir() {
+  local dir="$1"
+  _CHECK_MODEL_ERR=""
+
+  if [[ ! -f "$dir/config.json" ]]; then
+    _CHECK_MODEL_ERR="missing config.json"
+    return 1
+  fi
+
+  if ! _check_tokenizer_assets "$dir"; then
+    _CHECK_MODEL_ERR="missing tokenizer assets (set VLLM_SKIP_TOKENIZER_CHECK=1 if this repo uses a nonstandard layout)"
+    return 1
+  fi
+
+  shopt -s nullglob
+  local index_files=( "$dir"/*.index.json )
+  shopt -u nullglob
+
+  if (( ${#index_files[@]} > 0 )); then
+    local idx rc missing first_few
+    for idx in "${index_files[@]}"; do
+      # Preserve rc without fighting set -e.
+      if missing="$(_check_shard_index_complete "$dir" "$idx")"; then
+        rc=0
+      else
+        rc=$?
+      fi
+
+      if [[ $rc -eq 2 ]]; then
+        _CHECK_MODEL_ERR="unparseable shard index $(basename "$idx") (install python3 to improve parsing)"
+        return 1
+      fi
+      if [[ $rc -eq 1 ]]; then
+        first_few="$(printf '%s\n' "$missing" | head -n 5 | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+        _CHECK_MODEL_ERR="missing shard files from $(basename "$idx") (first: ${first_few})"
+        return 1
+      fi
+    done
+    return 0
+  fi
+
+  # No index: detect common "-00001-of-000NN" and require full set.
+  local missing_no_index rc_no_index first_few
+  if missing_no_index="$(_check_of_shards_complete_no_index "$dir")"; then
+    return 0
+  else
+    rc_no_index=$?
+    if [[ $rc_no_index -eq 1 ]]; then
+      first_few="$(printf '%s\n' "$missing_no_index" | head -n 5 | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+      _CHECK_MODEL_ERR="incomplete sharded weights (no index) (first missing: ${first_few})"
+      return 1
+    fi
+    # rc=2 => no shard pattern detected; continue with "any weight exists" check.
+  fi
+
+  shopt -s nullglob
+  local weights=(
+    "$dir"/*.safetensors
+    "$dir"/pytorch_model*.bin
+    "$dir"/*.bin
+    "$dir"/*.pt
+    "$dir"/*.pth
+    "$dir"/*.gguf
+  )
+  shopt -u nullglob
+
+  if (( ${#weights[@]} == 0 )); then
+    _CHECK_MODEL_ERR="missing weights files"
+    return 1
+  fi
+
+  return 0
+}
+
+# Deterministic HF cache snapshot selection:
+#   1) refs/main if present and valid
+#   2) otherwise, snapshots sorted newest->oldest by mtime
+# Echoes HF_HOME base_dir on success.
+_check_hf_cache() {
+  local base_dir="$1"
+  local slug="$2"
+  local cache_dir="$base_dir/hub/models--$slug"
+
+  [[ -d "$cache_dir/snapshots" ]] || return 1
+
+  local ref="$cache_dir/refs/main"
+  if [[ -f "$ref" ]]; then
+    local rev snap
+    rev="$(<"$ref")"
+    snap="$cache_dir/snapshots/$rev"
+    if [[ -d "$snap" ]] && _check_model_dir "$snap"; then
+      printf '%s' "$base_dir"
+      return 0
+    fi
+  fi
+
+  local snap_dir
+  while IFS= read -r snap_dir; do
+    [[ -d "$snap_dir" ]] || continue
+    if _check_model_dir "${snap_dir%/}"; then
+      printf '%s' "$base_dir"
+      return 0
+    fi
+  done < <(ls -td "$cache_dir/snapshots"/*/ 2>/dev/null || true)
+
+  return 1
+}
+
+_write_env_atomically() {
+  local env_file="$1"
+  local hf_home="${2:-}"
+  local model_id="$3"
+  local model_path="${4:-}"
+  local resolved_model="$5"
+  local resolved_via="$6"
+
+  local env_dir
+  env_dir="$(dirname "$env_file")"
+  mkdir -p "$env_dir"
+
+  local tmp
+  tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+  {
+    echo "# generated by vllm-resolve-model"
+    [[ -n "$hf_home" ]] && printf 'export HF_HOME=%q\n' "$hf_home"
+    printf 'export VLLM_MODEL=%q\n' "$VLLM_MODEL"
+    printf 'export VLLM_MODEL_ID=%q\n' "$model_id"
+    [[ -n "$model_path" ]] && printf 'export VLLM_MODEL_PATH=%q\n' "$model_path"
+    printf 'export _VLLM_RESOLVED_MODEL=%q\n' "$resolved_model"
+    printf 'export _VLLM_RESOLVED_VIA=%q\n' "$resolved_via"
+  } >"$tmp"
+
+  mv -f "$tmp" "$env_file"
+  chmod 600 "$env_file" 2>/dev/null || true
+}
+
+_restore_backup_if_missing() {
+  local target="$1"
+  [[ -e "$target" ]] && return 0
+
+  local newest_backup
+  newest_backup="$(ls -td "${target}.bak."* 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$newest_backup" && -e "$newest_backup" ]]; then
+    _warn "Target missing; restoring backup $(basename "$newest_backup")"
+    mv "$newest_backup" "$target"
+  fi
+  return 0
+}
+
+_atomic_swap_dir() {
+  # Replace target dir with staged dir using a backup+swap pattern.
+  # If interrupted mid-swap, next run restores the newest backup.
+  local staged="$1"
+  local target="$2"
+
+  _restore_backup_if_missing "$target"
+
+  local backup="${target}.bak.$RANDOM$RANDOM"
+  if [[ -e "$target" ]]; then
+    mv "$target" "$backup"
+  fi
+
+  if mv "$staged" "$target"; then
+    [[ -e "$backup" ]] && rm -rf "$backup"
+    return 0
+  fi
+
+  [[ -e "$backup" ]] && mv "$backup" "$target" || true
+  return 1
+}
+
+_mk_stage_dir() {
+  # mktemp -d under stage base to avoid collisions.
+  local base="$1"
+  local prefix="$2"
+  mktemp -d "${base%/}/${prefix}.XXXXXX"
+}
+
+# Download a full repo into a local dir, preferring stable tooling:
+#   1) `hf download` (huggingface_hub)
+#   2) `huggingface-cli download`
+#   3) python snapshot_download (huggingface_hub)
+_hf_download_repo_to_dir() {
+  local repo_id="$1"
+  local out_dir="$2"
+  local log="$3"
+
+  if _has_cmd hf; then
+    _run_to_log "$log" hf download "$repo_id" --local-dir "$out_dir"
+    return $?
+  fi
+
+  if _has_cmd huggingface-cli; then
+    if _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir" --local-dir-use-symlinks False; then
+      return 0
+    fi
+    _run_to_log "$log" huggingface-cli download "$repo_id" --local-dir "$out_dir"
+    return $?
+  fi
+
+  if _has_cmd python3; then
+    : >"$log"
+    python3 - "$repo_id" "$out_dir" >>"$log" 2>&1 <<'PY'
+import sys
+repo_id, out_dir = sys.argv[1], sys.argv[2]
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id=repo_id, local_dir=out_dir, local_dir_use_symlinks=False)
+print(out_dir)
+PY
+    return $?
+  fi
+
+  echo "No Hugging Face download tool found (need hf, huggingface-cli, or python3+huggingface_hub)" >>"$log"
+  return 127
+}
+
+# -------------------- inputs / defaults --------------------
+
+: "${VLLM_MODEL:?Set VLLM_MODEL}"
+: "${VLLM_MODELS_DIR:?Set VLLM_MODELS_DIR}"
+_validate_model_name "$VLLM_MODEL"
+
+VLLM_MODEL_ID="${VLLM_MODEL_ID:-}"
+VLLM_MODEL_ORG="${VLLM_MODEL_ORG:-}"
+VLLM_MODEL_SOURCES="${VLLM_MODEL_SOURCES:-flox,local,hf-cache,r2,hf-hub}"
+VLLM_RESOLVE_LOCK_TIMEOUT="${VLLM_RESOLVE_LOCK_TIMEOUT:-300}"
+
+mkdir -p "$VLLM_MODELS_DIR"
+
+_target_dir="$VLLM_MODELS_DIR/$VLLM_MODEL"
+_restore_backup_if_missing "$_target_dir"
+
+_model_id=""
+if [[ -z "$VLLM_MODEL_ID" ]]; then
+  [[ -n "$VLLM_MODEL_ORG" ]] || _die "VLLM_MODEL_ID is empty; set VLLM_MODEL_ORG to derive it."
+  _model_id="$VLLM_MODEL_ORG/$VLLM_MODEL"
+else
+  _model_id="$VLLM_MODEL_ID"
+fi
+
+# Slug for filenames (safe chars only)
+_model_slug="$(_slugify "$_model_id")"
+# HF cache slug: HuggingFace uses "models--org--name" directory convention
+_hf_slug="${_model_id//\//-\-}"
+
+# Per-model env file by default (prevents cross-model stale-cache incidents)
+VLLM_MODEL_ENV_FILE="${VLLM_MODEL_ENV_FILE:-}"
+if [[ -z "$VLLM_MODEL_ENV_FILE" ]]; then
+  : "${FLOX_ENV_CACHE:?Set FLOX_ENV_CACHE or override VLLM_MODEL_ENV_FILE}"
+  if _hash12="$(_sha256_12 "$_model_id")"; then
+    VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${_model_slug}.${_hash12}.env"
+  else
+    VLLM_MODEL_ENV_FILE="$FLOX_ENV_CACHE/vllm-model.${_model_slug}.env"
+  fi
+fi
+_model_env="$VLLM_MODEL_ENV_FILE"
+
+# Ensure env dir exists before opening lock file (redirect would fail otherwise)
+mkdir -p "$(dirname "$_model_env")"
+
+# Lock per-model.
+_lock_file="${_model_env}.lock"
+_lock_dir="${_model_env}.lockdir"
+_lock_mode=""
+
+_acquire_lock() {
+  if _has_cmd flock; then
+    _lock_mode="flock"
+    exec 9>"$_lock_file"
+    flock -w "$VLLM_RESOLVE_LOCK_TIMEOUT" 9 || _die "lock timeout: $_lock_file"
+    return 0
+  fi
+
+  _lock_mode="mkdir"
+  local i
+  for ((i=0; i<VLLM_RESOLVE_LOCK_TIMEOUT; i++)); do
+    mkdir "$_lock_dir" 2>/dev/null && return 0
+    sleep 1
+  done
+  _die "lock timeout: $_lock_dir"
+}
+
+_release_lock() {
+  if [[ "$_lock_mode" == "mkdir" ]]; then
+    rmdir "$_lock_dir" 2>/dev/null || true
+  fi
+}
+
+_resolved_via=""
+_resolved_model=""
+_did_resolve=0
+
+_source_errors=""
+_add_error() { _source_errors+=$'  '"$1"$'\n'; }
+
+_stage_base="$VLLM_MODELS_DIR/.staging"
+mkdir -p "$_stage_base"
+
+# Track logs and stage dirs across attempts (avoid leaks between failed sources).
+_logfiles=()
+_stage_dirs=()
+
+_cleanup_stages() {
+  local sd
+  for sd in "${_stage_dirs[@]}"; do
+    [[ -n "$sd" && -d "$sd" ]] && rm -rf "$sd" || true
+  done
+}
+
+_cleanup_logs_on_success() {
+  local lf
+  for lf in "${_logfiles[@]}"; do
+    [[ -f "$lf" ]] && rm -f "$lf" || true
+  done
+}
+
+cleanup() {
+  # Always remove any leftover staging dirs from THIS run.
+  _cleanup_stages
+
+  # Keep logs on failure; delete on success unless VLLM_KEEP_LOGS=1.
+  if [[ "${VLLM_KEEP_LOGS:-0}" != "1" && "${_did_resolve:-0}" -eq 1 ]]; then
+    _cleanup_logs_on_success
+  fi
+
+  _release_lock
+}
+trap cleanup EXIT
+
+_acquire_lock
+
+IFS=',' read -ra _sources <<< "$VLLM_MODEL_SOURCES"
+for _src in "${_sources[@]}"; do
+  _src="$(_trim "$_src")"
+  [[ -n "$_src" ]] || continue
+
+  case "$_src" in
+    flox)
+      printf "[model] Checking flox package... "
+      if [[ -z "${FLOX_ENV:-}" ]]; then
+        echo "skipped (FLOX_ENV not set)"
+        _add_error "flox: FLOX_ENV not set"
+        continue
+      fi
+      if _hf_home=$(_check_hf_cache "$FLOX_ENV/share/models" "$_hf_slug"); then
+        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "flox"
+        _resolved_via="flox"; _resolved_model="$_model_id"; _did_resolve=1
+        echo "OK"
+        break
+      else
+        echo "not found"
+        _add_error "flox: no usable HF snapshot at \$FLOX_ENV/share/models/hub/models--${_hf_slug}/"
+      fi
+      ;;
+
+    local)
+      printf "[model] Checking local directory... "
+      if _check_model_dir "$_target_dir"; then
+        _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "local"
+        _resolved_via="local"; _resolved_model="$_target_dir"; _did_resolve=1
+        echo "OK"
+        break
+      else
+        echo "not found"
+        _add_error "local: $_target_dir failed validation: ${_CHECK_MODEL_ERR}"
+      fi
+      ;;
+
+    hf-cache)
+      printf "[model] Checking HF cache... "
+      if _hf_home=$(_check_hf_cache "$VLLM_MODELS_DIR" "$_hf_slug"); then
+        _write_env_atomically "$_model_env" "$_hf_home" "$_model_id" "" "$_model_id" "hf-cache"
+        _resolved_via="hf-cache"; _resolved_model="$_model_id"; _did_resolve=1
+        echo "OK"
+        break
+      else
+        echo "not found"
+        _add_error "hf-cache: no usable HF snapshot at $VLLM_MODELS_DIR/hub/models--${_hf_slug}/ (last check: ${_CHECK_MODEL_ERR:-unknown})"
+      fi
+      ;;
+
+    r2)
+      printf "[model] Fetching from R2... "
+      if ! _has_cmd aws; then
+        echo "skipped (aws not found)"
+        _add_error "r2: aws CLI not available in PATH"
+        continue
+      fi
+      if [[ -z "${R2_BUCKET:-}" || -z "${R2_MODELS_PREFIX:-}" ]]; then
+        echo "skipped (R2_BUCKET/R2_MODELS_PREFIX not set)"
+        _add_error "r2: set R2_BUCKET and R2_MODELS_PREFIX"
+        continue
+      fi
+
+      _aws_endpoint_args=()
+      [[ -n "${R2_ENDPOINT_URL:-}" ]] && _aws_endpoint_args+=(--endpoint-url "$R2_ENDPOINT_URL")
+
+      if ! aws "${_aws_endpoint_args[@]}" sts get-caller-identity >/dev/null 2>&1; then
+        echo "failed (no credentials)"
+        _add_error "r2: aws sts get-caller-identity failed (credentials/config)"
+        continue
+      fi
+
+      _restore_backup_if_missing "$_target_dir"
+
+      stage_dir="$(_mk_stage_dir "$_stage_base" "${VLLM_MODEL}.r2")"
+      _stage_dirs+=("$stage_dir")
+
+      logfile="$(mktemp "$_stage_base/${VLLM_MODEL}.r2.log.XXXXXX")"
+      _logfiles+=("$logfile")
+
+      if _run_to_log "$logfile" aws "${_aws_endpoint_args[@]}" s3 sync \
+          "s3://$R2_BUCKET/$R2_MODELS_PREFIX/$VLLM_MODEL/" \
+          "$stage_dir/" \
+          --no-progress; then
+
+        if _check_model_dir "$stage_dir"; then
+          : >"$stage_dir/.complete"
+          if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
+            _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "r2"
+            _resolved_via="r2"; _resolved_model="$_target_dir"; _did_resolve=1
+            echo "OK"
+            break
+          else
+            echo "failed (swap error)"
+            _add_error "r2: staged download validated, but swap into $_target_dir failed (see log: $logfile)"
+          fi
+        else
+          echo "failed (incomplete after sync)"
+          _add_error "r2: staged dir failed validation: ${_CHECK_MODEL_ERR} (see log: $logfile)"
+        fi
+      else
+        echo "failed (sync error)"
+        _add_error "r2: aws s3 sync failed — tail: $(_tail_one_line "$logfile" 80) (full log: $logfile)"
+      fi
+
+      # Avoid stage-dir leaks across multiple remote attempts in one run.
+      [[ -n "${stage_dir:-}" && -d "${stage_dir:-}" ]] && rm -rf "$stage_dir" || true
+      stage_dir=""
+      ;;
+
+    hf-hub)
+      printf "[model] Downloading from HuggingFace Hub... "
+      _restore_backup_if_missing "$_target_dir"
+
+      stage_dir="$(_mk_stage_dir "$_stage_base" "${VLLM_MODEL}.hf")"
+      _stage_dirs+=("$stage_dir")
+
+      logfile="$(mktemp "$_stage_base/${VLLM_MODEL}.hf.log.XXXXXX")"
+      _logfiles+=("$logfile")
+
+      if _hf_download_repo_to_dir "$_model_id" "$stage_dir" "$logfile"; then
+        if _check_model_dir "$stage_dir"; then
+          : >"$stage_dir/.complete"
+          if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
+            _write_env_atomically "$_model_env" "" "$_model_id" "$_target_dir" "$_target_dir" "hf-hub"
+            _resolved_via="hf-hub"; _resolved_model="$_target_dir"; _did_resolve=1
+            echo "OK"
+            break
+          else
+            echo "failed (swap error)"
+            _add_error "hf-hub: staged download validated, but swap into $_target_dir failed (see log: $logfile)"
+          fi
+        else
+          echo "failed (incomplete after download)"
+          _add_error "hf-hub: staged dir failed validation: ${_CHECK_MODEL_ERR} (see log: $logfile)"
+        fi
+      else
+        echo "failed (download error)"
+        _add_error "hf-hub: download failed — tail: $(_tail_one_line "$logfile" 80) (full log: $logfile)"
+      fi
+
+      # Avoid stage-dir leaks across multiple remote attempts in one run.
+      [[ -n "${stage_dir:-}" && -d "${stage_dir:-}" ]] && rm -rf "$stage_dir" || true
+      stage_dir=""
+      ;;
+
+    *)
+      _warn "Unknown source '$_src' (skipping)"
+      ;;
+  esac
+done
+
+if [[ $_did_resolve -ne 1 ]]; then
+  echo "" >&2
+  echo "ERROR: Could not provision model '$VLLM_MODEL' ($_model_id) from any source." >&2
+  echo "  Tried (VLLM_MODEL_SOURCES=$VLLM_MODEL_SOURCES):" >&2
+  printf '%b' "$_source_errors" >&2
+
+  if (( ${#_logfiles[@]} > 0 )); then
+    echo "" >&2
+    echo "  Logs kept for debugging:" >&2
+    for lf in "${_logfiles[@]}"; do
+      [[ -f "$lf" ]] && echo "    $lf" >&2
+    done
+    echo "  (Set VLLM_KEEP_LOGS=1 to keep logs even on success.)" >&2
+  fi
+  exit 1
+fi
+
+echo "[model] Resolved: $_resolved_model (via $_resolved_via)"
+echo "[model] Env file: $_model_env"

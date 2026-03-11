@@ -1,0 +1,7 @@
+{
+  "build_version": 1,
+  "force_increment": 0,
+  "git_rev": "0af2747c5c9b7fcb9fd4b27d527a9e35c6e3f53b",
+  "git_rev_short": "0af2747",
+  "changelog": "Add canonical build version marker to nix derivation."
+}

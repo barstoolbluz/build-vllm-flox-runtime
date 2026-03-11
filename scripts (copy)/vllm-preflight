@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# vllm-preflight — Pre-flight validation: port reclaim + GPU health check + optional command exec.
+#
+# Platform: Linux only (requires /proc).
+# Note: Some systems restrict /proc/<pid>/fd visibility (hidepid). If so, this script may not
+#       attribute listening sockets to PIDs and will refuse to reclaim the port.
+#
+# Exit codes (stable contract):
+#   0 success (or nothing to do)
+#   1 general validation error / GPU hard failure / bad config
+#   2 port owned by non-vLLM listener(s)
+#   3 vLLM owned by different UID (blocked)
+#   4 listener found but not attributable (permissions/hidepid)
+#   5 attempted stop but port still listening
+#
+# Stdout/stderr contract:
+#   - stderr: human logs, warnings, errors
+#   - stdout: machine-readable output only when VLLM_PREFLIGHT_JSON=1 (single JSON line)
+#
+# JSON + downstream exec policy (strict):
+#   VLLM_PREFLIGHT_JSON=1 is incompatible with executing a downstream command, since it would
+#   share stdout and break the single-JSON-line contract.
+#
+# Env:
+#   VLLM_HOST                 Bind address (default: 0.0.0.0)
+#   VLLM_PORT                 Listen port  (default: 8000)
+#
+#   VLLM_OWNER_REGEX          Optional regex override to identify vLLM owners (matches cmdline or exe path)
+#                             Example: VLLM_OWNER_REGEX='vllm(\.entrypoints|.*serve)|openai\.api_server'
+#                             Recommendation: set this in your service wrapper for unusual launchers.
+#
+#   VLLM_DRY_RUN              If set to 1, do not send signals; report what would happen and exit.
+#                             In dry-run, exit codes are 0/2/3/4 only (never 5).
+#
+#   VLLM_GPU_WARN_PCT         Warn if used% exceeds this (default: 50)  (must be 0..100)
+#   VLLM_SKIP_GPU_CHECK       If set to 1, skip GPU checks (default: 0)
+#   VLLM_REQUIRE_TORCH        If set to 1, torch import must succeed (default: 0)
+#
+#   VLLM_ALLOW_KILL_OTHER_UID If set to 1, allow killing vLLM owned by other UIDs (default: 0)
+#
+#   VLLM_PREFLIGHT_LOCKFILE   Lock file path (default: /tmp/vllm-preflight.lock)
+#   VLLM_TERM_GRACE           Seconds to wait after SIGTERM before SIGKILL (default: 3)   (must be >= 0)
+#   VLLM_PORT_FREE_TIMEOUT    Seconds to wait for port to free (default: 10)              (must be >= 0)
+#   VLLM_PORT_FREE_POLL       Poll interval seconds while waiting (default: 0.5)          (must be > 0)
+#
+#   VLLM_PREFLIGHT_JSON       If set to 1, print a single JSON object on stdout (logs still on stderr)
+#
+# Usage:
+#   ./vllm-preflight                      # checks only
+#   ./vllm-preflight ./start.sh ...       # checks, then runs command
+#   ./vllm-preflight -- python -m ...     # checks, then runs command (after --)
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+log() { echo "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+
+VLLM_GPU_WARN_PCT="${VLLM_GPU_WARN_PCT:-50}"
+VLLM_SKIP_GPU_CHECK="${VLLM_SKIP_GPU_CHECK:-0}"
+VLLM_REQUIRE_TORCH="${VLLM_REQUIRE_TORCH:-0}"
+
+VLLM_ALLOW_KILL_OTHER_UID="${VLLM_ALLOW_KILL_OTHER_UID:-0}"
+VLLM_DRY_RUN="${VLLM_DRY_RUN:-0}"
+
+VLLM_PREFLIGHT_LOCKFILE="${VLLM_PREFLIGHT_LOCKFILE:-/tmp/vllm-preflight.lock}"
+
+VLLM_TERM_GRACE="${VLLM_TERM_GRACE:-3}"
+VLLM_PORT_FREE_TIMEOUT="${VLLM_PORT_FREE_TIMEOUT:-10}"
+VLLM_PORT_FREE_POLL="${VLLM_PORT_FREE_POLL:-0.5}"
+
+VLLM_PREFLIGHT_JSON="${VLLM_PREFLIGHT_JSON:-0}"
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_num() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+is_bool01() { [[ "$1" == "0" || "$1" == "1" ]]; }
+
+# Basic validation (bash-side)
+is_int "$VLLM_PORT" || die "VLLM_PORT must be an integer (got: $VLLM_PORT)"
+(( VLLM_PORT >= 1 && VLLM_PORT <= 65535 )) || die "VLLM_PORT out of range: $VLLM_PORT"
+
+is_num "$VLLM_GPU_WARN_PCT" || die "VLLM_GPU_WARN_PCT must be numeric (got: $VLLM_GPU_WARN_PCT)"
+is_num "$VLLM_TERM_GRACE" || die "VLLM_TERM_GRACE must be numeric (got: $VLLM_TERM_GRACE)"
+is_num "$VLLM_PORT_FREE_TIMEOUT" || die "VLLM_PORT_FREE_TIMEOUT must be numeric (got: $VLLM_PORT_FREE_TIMEOUT)"
+is_num "$VLLM_PORT_FREE_POLL" || die "VLLM_PORT_FREE_POLL must be numeric (got: $VLLM_PORT_FREE_POLL)"
+
+is_bool01 "$VLLM_DRY_RUN" || die "VLLM_DRY_RUN must be 0 or 1 (got: $VLLM_DRY_RUN)"
+is_bool01 "$VLLM_PREFLIGHT_JSON" || die "VLLM_PREFLIGHT_JSON must be 0 or 1 (got: $VLLM_PREFLIGHT_JSON)"
+is_bool01 "$VLLM_ALLOW_KILL_OTHER_UID" || die "VLLM_ALLOW_KILL_OTHER_UID must be 0 or 1 (got: $VLLM_ALLOW_KILL_OTHER_UID)"
+is_bool01 "$VLLM_SKIP_GPU_CHECK" || die "VLLM_SKIP_GPU_CHECK must be 0 or 1 (got: $VLLM_SKIP_GPU_CHECK)"
+is_bool01 "$VLLM_REQUIRE_TORCH" || die "VLLM_REQUIRE_TORCH must be 0 or 1 (got: $VLLM_REQUIRE_TORCH)"
+
+# Determine downstream command (for JSON/exec policy check)
+_downstream=()
+if [[ $# -gt 0 ]]; then
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+  if [[ $# -gt 0 ]]; then _downstream=("$@"); fi
+fi
+
+if [[ "$VLLM_PREFLIGHT_JSON" == "1" && ${#_downstream[@]} -gt 0 ]]; then
+  die "VLLM_PREFLIGHT_JSON=1 is incompatible with executing a downstream command (stdout would not stay JSON-only)."
+fi
+
+# python3 must exist before any python3 usage
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
+
+# Range sanity (no assert; survives PYTHONOPTIMIZE)
+python3 - "$VLLM_GPU_WARN_PCT" <<'PY' || die "VLLM_GPU_WARN_PCT must be between 0 and 100"
+import sys
+x = float(sys.argv[1])
+raise SystemExit(0 if (0.0 <= x <= 100.0) else 1)
+PY
+
+python3 - "$VLLM_PORT_FREE_POLL" <<'PY' || die "VLLM_PORT_FREE_POLL must be > 0"
+import sys
+x = float(sys.argv[1])
+raise SystemExit(0 if x > 0 else 1)
+PY
+
+python3 - "$VLLM_TERM_GRACE" <<'PY' || die "VLLM_TERM_GRACE must be >= 0"
+import sys
+x = float(sys.argv[1])
+raise SystemExit(0 if x >= 0 else 1)
+PY
+
+python3 - "$VLLM_PORT_FREE_TIMEOUT" <<'PY' || die "VLLM_PORT_FREE_TIMEOUT must be >= 0"
+import sys
+x = float(sys.argv[1])
+raise SystemExit(0 if x >= 0 else 1)
+PY
+
+# --- lock to prevent two preflights fighting each other ---
+if command -v flock >/dev/null 2>&1; then
+  # Lockfile hardening (especially relevant if run with elevated privileges)
+  if [[ -e "$VLLM_PREFLIGHT_LOCKFILE" ]]; then
+    if [[ -L "$VLLM_PREFLIGHT_LOCKFILE" ]]; then
+      die "Lockfile exists but is a symlink: $VLLM_PREFLIGHT_LOCKFILE"
+    fi
+    if [[ ! -f "$VLLM_PREFLIGHT_LOCKFILE" ]]; then
+      die "Lockfile exists but is not a regular file: $VLLM_PREFLIGHT_LOCKFILE"
+    fi
+  fi
+
+  _old_umask="$(umask)"
+  umask 077
+  exec 9>>"$VLLM_PREFLIGHT_LOCKFILE"
+  flock -n 9 || { umask "$_old_umask"; die "Another vllm-preflight is running (lock: $VLLM_PREFLIGHT_LOCKFILE)"; }
+  umask "$_old_umask"
+else
+  # Lockdir fallback with stale detection (best-effort; prefer flock-capable hosts)
+  _lockdir="${VLLM_PREFLIGHT_LOCKFILE}.d"
+  _pidfile="$_lockdir/pid"
+
+  if mkdir "$_lockdir" 2>/dev/null; then
+    echo "$$" >"$_pidfile" 2>/dev/null || true
+    trap 'rm -f "$_pidfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
+  else
+    if [[ -f "$_pidfile" ]]; then
+      _oldpid="$(cat "$_pidfile" 2>/dev/null || true)"
+      if [[ "$_oldpid" =~ ^[0-9]+$ ]] && ! kill -0 "$_oldpid" 2>/dev/null; then
+        log "WARNING: Removing stale lockdir (pid $_oldpid not running): $_lockdir"
+        rm -f "$_pidfile" 2>/dev/null || true
+        rmdir "$_lockdir" 2>/dev/null || true
+        mkdir "$_lockdir" 2>/dev/null || die "Another vllm-preflight is running (lockdir: $_lockdir)"
+        echo "$$" >"$_pidfile" 2>/dev/null || true
+        trap 'rm -f "$_pidfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
+      else
+        die "Another vllm-preflight is running (lockdir: $_lockdir)"
+      fi
+    else
+      die "Another vllm-preflight is running (lockdir: $_lockdir)"
+    fi
+  fi
+fi
+
+# --- Port reclaim (multi-listener + UID safety + dry-run + fewer rescans) ---
+python3 - "$VLLM_HOST" "$VLLM_PORT" "$EUID" <<'PY'
+import os, sys, socket, struct, time, signal, re, json
+from collections import defaultdict
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+euid = int(sys.argv[3])
+
+allow_kill_other_uid = os.environ.get("VLLM_ALLOW_KILL_OTHER_UID", "0") == "1"
+dry_run = os.environ.get("VLLM_DRY_RUN", "0") == "1"
+term_grace = float(os.environ.get("VLLM_TERM_GRACE", "3"))
+free_timeout = float(os.environ.get("VLLM_PORT_FREE_TIMEOUT", "10"))
+free_poll = float(os.environ.get("VLLM_PORT_FREE_POLL", "0.5"))
+want_json = os.environ.get("VLLM_PREFLIGHT_JSON", "0") == "1"
+
+owner_regex = os.environ.get("VLLM_OWNER_REGEX", "").strip()
+owner_re = None
+if owner_regex:
+    try:
+        owner_re = re.compile(owner_regex, re.IGNORECASE)
+    except re.error as e:
+        print(f"ERROR: Invalid VLLM_OWNER_REGEX: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def emit(obj):
+    if want_json:
+        print(json.dumps(obj, separators=(",", ":")))
+
+def read_int(path, default=0):
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
+bindv6only = read_int("/proc/sys/net/ipv6/bindv6only", 0)
+
+def encode_ipv4(addr: str) -> str:
+    if addr in ("0.0.0.0", ""):
+        return "00000000"
+    b = socket.inet_aton(addr)
+    return struct.pack("<I", struct.unpack(">I", b)[0]).hex().upper()
+
+def encode_ipv6(addr: str) -> str:
+    if addr in ("::", ""):
+        return "0" * 32
+    b = socket.inet_pton(socket.AF_INET6, addr)
+    words = [b[i:i+4][::-1] for i in range(0, 16, 4)]
+    return b"".join(words).hex().upper()
+
+def parse_proc_net(path: str):
+    try:
+        with open(path, "r") as f:
+            next(f, None)
+            for line in f:
+                fields = line.split()
+                if len(fields) < 10:
+                    continue
+                yield fields[1].upper(), fields[3], fields[9]  # local_addr, state, inode
+    except FileNotFoundError:
+        return
+
+def resolve_ips(h: str):
+    if h in ("", "0.0.0.0", "::"):
+        return [h]
+    addrs = set()
+    try:
+        for fam, _, _, _, sa in socket.getaddrinfo(h, port, type=socket.SOCK_STREAM):
+            if fam == socket.AF_INET:
+                addrs.add(sa[0])
+            elif fam == socket.AF_INET6:
+                addrs.add(sa[0])
+    except socket.gaierror:
+        addrs.add(h)
+    return sorted(addrs)
+
+def build_targets(h: str, p: int):
+    port_hex = f"{p:04X}"
+    ips = resolve_ips(h)
+    has_v6 = any(":" in ip for ip in ips) or h == "::"
+    v4_targets, v6_targets = set(), set()
+
+    for ip in ips:
+        if ":" in ip:
+            try: v6_targets.add(f"{encode_ipv6(ip)}:{port_hex}")
+            except OSError: pass
+        else:
+            try: v4_targets.add(f"{encode_ipv4(ip)}:{port_hex}")
+            except OSError: pass
+
+    v4_targets.add(f"{encode_ipv4('0.0.0.0')}:{port_hex}")
+    if has_v6 or bindv6only == 0:
+        v6_targets.add(f"{encode_ipv6('::')}:{port_hex}")
+
+    return v4_targets, v6_targets
+
+def find_listen_inodes(h: str, p: int):
+    v4_targets, v6_targets = build_targets(h, p)
+    inodes = set()
+    for local_addr, state, inode in parse_proc_net("/proc/net/tcp"):
+        if state == "0A" and local_addr in v4_targets:
+            inodes.add(inode)
+    for local_addr, state, inode in parse_proc_net("/proc/net/tcp6"):
+        if state == "0A" and local_addr in v6_targets:
+            inodes.add(inode)
+    return inodes
+
+def inode_to_pids(inodes):
+    want = set(inodes)
+    mapping = {inode: set() for inode in want}
+    unmapped = set(want)
+
+    for pid_dir in os.listdir("/proc"):
+        if not pid_dir.isdigit():
+            continue
+        fd_dir = f"/proc/{pid_dir}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except (PermissionError, FileNotFoundError):
+            continue
+
+        for fd in fds:
+            try:
+                link = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link.endswith("]"):
+                inode = link[8:-1]
+                if inode in want:
+                    mapping[inode].add(int(pid_dir))
+                    unmapped.discard(inode)
+
+    return mapping, unmapped
+
+def read_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+        return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+def read_comm(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def read_exe(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except Exception:
+        return ""
+
+def read_uid(pid: int):
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    parts = line.split()
+                    return int(parts[1])
+    except Exception:
+        return None
+    return None
+
+def default_is_vllm(cmd: str, exe: str) -> bool:
+    s = cmd.lower()
+    if "vllm" not in s:
+        return False
+    if ("vllm.entrypoints" in s) or ("openai.api_server" in s) or (" entrypoints.openai" in s) or (" serve" in s):
+        return True
+    ex = (exe or "").lower()
+    return ("python" in ex)
+
+def is_vllm(cmd: str, exe: str) -> bool:
+    if owner_re:
+        return bool(owner_re.search(cmd) or owner_re.search(exe))
+    return default_is_vllm(cmd, exe)
+
+def build_children_map():
+    children = defaultdict(list)
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat", "r") as f:
+                parts = f.read().split()
+            pid = int(parts[0]); ppid = int(parts[3])
+            children[ppid].append(pid)
+        except Exception:
+            continue
+    return children
+
+def postorder_iter(children, roots):
+    out = []
+    seen = set()
+    stack = [(r, False) for r in roots]  # (pid, expanded)
+    while stack:
+        pid, expanded = stack.pop()
+        if pid in seen and not expanded:
+            continue
+        if expanded:
+            out.append(pid)
+            continue
+        seen.add(pid)
+        stack.append((pid, True))
+        for c in children.get(pid, []):
+            if c not in seen:
+                stack.append((c, False))
+    return out
+
+def pid_is_effectively_dead(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            s = f.read()
+        r = s.rfind(")")
+        if r == -1:
+            return False
+        rest = s[r+2:]
+        state = rest.split(" ", 1)[0]
+        return state == "Z"
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+def is_alive_for_wait(pid: int) -> bool:
+    if not os.path.exists(f"/proc/{pid}"):
+        return False
+    return not pid_is_effectively_dead(pid)
+
+def kill_pids_tree(roots):
+    children = build_children_map()
+    targets = postorder_iter(children, roots)
+
+    for pid in targets:
+        try: os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError): pass
+
+    deadline = time.time() + term_grace
+    while time.time() < deadline:
+        if not any(is_alive_for_wait(pid) for pid in targets):
+            return
+        time.sleep(0.1)
+
+    for pid in targets:
+        try: os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError): pass
+
+def port_still_listening(h: str, p: int) -> bool:
+    v4_targets, v6_targets = build_targets(h, p)
+    for local_addr, state, _ in parse_proc_net("/proc/net/tcp"):
+        if state == "0A" and local_addr in v4_targets:
+            return True
+    for local_addr, state, _ in parse_proc_net("/proc/net/tcp6"):
+        if state == "0A" and local_addr in v6_targets:
+            return True
+    return False
+
+# --- main flow ---
+inodes = find_listen_inodes(host, port)
+if not inodes:
+    emit({"status":"ok","action":"noop","dry_run":dry_run})
+    sys.exit(0)
+
+mapping, unmapped = inode_to_pids(inodes)
+if unmapped:
+    print(f"ERROR: Found listener socket(s) on {host}:{port} but could not map inode(s) to PID(s): {', '.join(sorted(unmapped))}", file=sys.stderr)
+    print("  Your system may restrict /proc/<pid>/fd visibility; run as the owning user (or relax hidepid), or free the port manually.", file=sys.stderr)
+    sys.exit(4)
+
+pids = sorted({pid for s in mapping.values() for pid in s})
+if not pids:
+    print(f"ERROR: Found listener socket(s) on {host}:{port} but could not identify any owner PID.", file=sys.stderr)
+    sys.exit(4)
+
+pid_info = []
+vllm_pids = []
+non_vllm = []
+
+for pid in pids:
+    cmd = read_cmdline(pid)
+    exe = read_exe(pid)
+    uid = read_uid(pid)
+    comm = read_comm(pid)
+    pid_info.append((pid, uid, comm, exe, cmd))
+    if is_vllm(cmd, exe):
+        vllm_pids.append(pid)
+    else:
+        non_vllm.append(pid)
+
+if non_vllm:
+    print(f"ERROR: Port {port} is in use by non-vLLM process(es). Refusing to kill.", file=sys.stderr)
+    for pid, uid, comm, exe, cmd in pid_info:
+        tag = "vLLM" if pid in vllm_pids else "non-vLLM"
+        print(f"  PID {pid} (uid {uid}) comm={comm} exe={exe} [{tag}] {cmd}", file=sys.stderr)
+    if any(comm == "systemd" or pid == 1 or "systemd" in (cmd.lower() + " " + comm.lower()) for pid, _, comm, _, cmd in pid_info):
+        print("  Hint: This can happen with systemd socket activation (.socket unit owns the listener).", file=sys.stderr)
+    sys.exit(2)
+
+bad_uid = [(pid, uid, comm, exe, cmd) for pid, uid, comm, exe, cmd in pid_info if (uid is not None and uid != euid)]
+if bad_uid and not allow_kill_other_uid:
+    print(f"ERROR: Listener(s) on port {port} belong to a different UID. Refusing to kill.", file=sys.stderr)
+    for pid, uid, comm, exe, cmd in bad_uid:
+        print(f"  PID {pid} (uid {uid}) comm={comm} exe={exe} {cmd}", file=sys.stderr)
+    print("  Set VLLM_ALLOW_KILL_OTHER_UID=1 to override.", file=sys.stderr)
+    sys.exit(3)
+
+if dry_run:
+    print(f"DRY-RUN: Port {port} is owned by vLLM PID(s): {', '.join(map(str, vllm_pids))}", file=sys.stderr)
+    print("DRY-RUN: Would stop vLLM process tree(s) for:", file=sys.stderr)
+    for pid, uid, comm, exe, cmd in pid_info:
+        print(f"  PID {pid} (uid {uid}) comm={comm} exe={exe} {cmd}", file=sys.stderr)
+    emit({"status":"ok","action":"would_stop","dry_run":True,"pids":vllm_pids})
+    sys.exit(0)
+
+print(f"Port {port} is owned by vLLM PID(s): {', '.join(map(str, vllm_pids))}", file=sys.stderr)
+print("Stopping vLLM process tree(s)...", file=sys.stderr)
+
+kill_pids_tree(vllm_pids)
+
+deadline = time.time() + free_timeout
+while time.time() < deadline:
+    if not port_still_listening(host, port):
+        emit({"status":"ok","action":"stopped","dry_run":False,"pids":vllm_pids})
+        sys.exit(0)
+    time.sleep(free_poll)
+
+inodes2 = find_listen_inodes(host, port)
+mapping2, _unmapped2 = inode_to_pids(inodes2) if inodes2 else ({}, set())
+pids2 = sorted({pid for s in mapping2.values() for pid in s})
+
+print(f"ERROR: Port {port} still appears to be listening after stop attempt.", file=sys.stderr)
+if pids2:
+    for pid in pids2:
+        print(f"  PID {pid}: {read_cmdline(pid)}", file=sys.stderr)
+else:
+    print("  (Could not map remaining listener to PID.)", file=sys.stderr)
+
+sys.exit(5)
+PY
+
+# --- GPU health check (read-only) ---
+if [[ "$VLLM_SKIP_GPU_CHECK" != "1" ]]; then
+  if python3 -c "import torch" >/dev/null 2>&1; then
+    python3 - "$VLLM_GPU_WARN_PCT" <<'PY'
+import sys, torch
+warn_pct = float(sys.argv[1])
+
+if not torch.cuda.is_available():
+    print("ERROR: No CUDA GPUs available.", file=sys.stderr)
+    sys.exit(1)
+
+n = torch.cuda.device_count()
+for i in range(n):
+    props = torch.cuda.get_device_properties(i)
+    total = props.total_memory
+    free, _ = torch.cuda.mem_get_info(i)
+    used_pct = (total - free) / total * 100.0
+    print(f"GPU {i}: {props.name} — {free // 1048576}MiB free / {total // 1048576}MiB total ({used_pct:.0f}% used)", file=sys.stderr)
+    if used_pct > warn_pct:
+        print(f"WARNING: GPU {i} memory is {used_pct:.0f}% consumed before vLLM starts.", file=sys.stderr)
+PY
+  else
+    if [[ "$VLLM_REQUIRE_TORCH" == "1" ]]; then
+      die "torch import failed (VLLM_REQUIRE_TORCH=1). Install torch or set VLLM_SKIP_GPU_CHECK=1."
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      python3 - "$VLLM_GPU_WARN_PCT" <<'PY'
+import subprocess, sys
+warn_pct = float(sys.argv[1])
+
+try:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+except Exception as e:
+    print(f"WARNING: GPU check skipped (torch unavailable; nvidia-smi failed: {e})", file=sys.stderr)
+    sys.exit(0)
+
+for idx, line in enumerate(out.strip().splitlines()):
+    parts = [p.strip() for p in line.rsplit(",", 2)]  # tolerate commas in name
+    if len(parts) != 3:
+        print(f"WARNING: Unexpected nvidia-smi output line: {line}", file=sys.stderr)
+        continue
+    name, total, free = parts
+    total = float(total); free = float(free)
+    used_pct = (total - free) / total * 100.0 if total > 0 else 0.0
+    print(f"GPU {idx}: {name} — {int(free)}MiB free / {int(total)}MiB total ({used_pct:.0f}% used)", file=sys.stderr)
+    if used_pct > warn_pct:
+        print(f"WARNING: GPU {idx} memory is {used_pct:.0f}% consumed before vLLM starts.", file=sys.stderr)
+PY
+    else
+      log "WARNING: GPU check skipped (torch unavailable and nvidia-smi not found)."
+    fi
+  fi
+fi
+
+# --- Run downstream command if provided ---
+if [[ ${#_downstream[@]} -gt 0 ]]; then
+  exec "${_downstream[@]}"
+fi
